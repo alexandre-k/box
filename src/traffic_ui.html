@@ -1,0 +1,938 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>box — Live Network & DNS Traffic Monitor</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a23;
+    --panel-alt: #1e222e;
+    --border: #2b3040;
+    --text: #e6e9f2;
+    --muted: #8b93a7;
+    --green: #34d399;
+    --green-bg: rgba(52, 211, 153, 0.12);
+    --yellow: #fbbf24;
+    --yellow-bg: rgba(251, 191, 36, 0.12);
+    --red: #f87171;
+    --red-bg: rgba(248, 113, 113, 0.16);
+    --purple: #e879f9;
+    --purple-bg: rgba(232, 121, 249, 0.16);
+    --cyan: #38bdf8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+  header {
+    padding: 12px 18px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .title-group { display: flex; align-items: center; gap: 10px; }
+  .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+  }
+  .dot.offline { background: var(--red); box-shadow: 0 0 8px var(--red); }
+  h1 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0.4px; }
+  .policy-note { font-size: 11px; color: var(--muted); }
+  .stats { display: flex; gap: 8px; flex-wrap: wrap; }
+  .pill {
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    background: var(--panel-alt);
+    color: var(--text);
+    user-select: none;
+  }
+  .pill.active { outline: 2px solid var(--cyan); }
+  .pill.trusted { color: var(--green); border-color: rgba(52,211,153,0.4); }
+  .pill.unlisted { color: var(--yellow); border-color: rgba(251,191,36,0.4); }
+  .pill.suspicious { color: var(--red); border-color: rgba(248,113,113,0.4); }
+  .pill.blocked { color: var(--purple); border-color: rgba(232,121,249,0.5); }
+  .controls {
+    padding: 8px 18px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  input[type="text"], select {
+    padding: 6px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12px;
+  }
+  input[type="text"] { flex: 1; min-width: 180px; }
+  select { max-width: 240px; }
+  label.toggle { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  button, a.btn {
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--panel-alt);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 11.5px;
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  button:hover, a.btn:hover { border-color: var(--cyan); }
+  button.btn-allow { color: var(--green); border-color: rgba(52,211,153,0.45); background: var(--green-bg); }
+  button.btn-block { color: var(--red); border-color: rgba(248,113,113,0.45); background: var(--red-bg); }
+  button.btn-pcap, a.btn-pcap { color: var(--cyan); border-color: rgba(56,189,248,0.45); background: rgba(56,189,248,0.1); }
+  button.btn-muted { color: var(--muted); }
+  main {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+  }
+  .feed-wrap {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 12px 24px 12px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12.5px;
+  }
+  thead th {
+    position: sticky;
+    top: 0;
+    background: var(--bg);
+    color: var(--muted);
+    text-align: left;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+    z-index: 2;
+  }
+  tbody tr {
+    border-bottom: 1px solid rgba(43, 48, 64, 0.55);
+    cursor: pointer;
+  }
+  tbody tr:hover { background: var(--panel-alt); }
+  tbody tr.selected { outline: 1px solid var(--cyan); background: #21283a; }
+  tbody tr.row-blocked { background: rgba(232, 121, 249, 0.11); }
+  tbody tr.verdict-suspicious { background: var(--red-bg); }
+  tbody tr.verdict-unlisted:not(.row-blocked) { background: rgba(251, 191, 36, 0.04); }
+  td { padding: 6px 8px; vertical-align: middle; white-space: nowrap; }
+  td .cell-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    max-width: 100%;
+  }
+  td .cell-val {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    user-select: text;
+  }
+  td.domain-cell { max-width: 380px; font-weight: 600; }
+  .sub-part { opacity: 0.92; text-decoration: underline dotted rgba(255,255,255,0.22); text-underline-offset: 2px; }
+  td.ip-cell { color: var(--cyan); max-width: 190px; }
+  td.cmd-cell { max-width: 240px; color: #cbd5e1; }
+  td.time-cell, td.type-cell { color: var(--muted); }
+  .copy-btn {
+    opacity: 0;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 0 4px;
+    border-radius: 3px;
+    font-size: 10px;
+    line-height: 1.4;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: opacity 0.1s;
+  }
+  td:hover .copy-btn,
+  th:hover .copy-btn,
+  .kv-val-wrap:hover .copy-btn,
+  .ip-chip:hover .copy-btn,
+  .copy-btn:focus {
+    opacity: 1;
+  }
+  .copy-btn:hover { color: var(--cyan); border-color: var(--cyan); }
+  .kv-val-wrap {
+    display: inline-flex;
+    align-items: flex-start;
+    gap: 6px;
+    max-width: 100%;
+  }
+  .ip-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+  }
+  .toast {
+    position: fixed;
+    bottom: 16px;
+    right: 18px;
+    background: var(--panel-alt);
+    border: 1px solid var(--cyan);
+    color: var(--text);
+    padding: 7px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s;
+    z-index: 50;
+    max-width: 420px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .toast.show { opacity: 1; }
+  .badge {
+    display: inline-block;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 10.5px;
+    font-weight: 700;
+    margin-right: 4px;
+  }
+  .badge.trusted { color: var(--green); background: var(--green-bg); }
+  .badge.unlisted { color: var(--yellow); background: var(--yellow-bg); }
+  .badge.suspicious { color: var(--red); background: var(--red-bg); }
+  .badge.blocked { color: var(--purple); background: var(--purple-bg); border: 1px solid rgba(232,121,249,0.45); }
+  .badge.allowed-net { color: var(--green); background: var(--green-bg); }
+  .domain-trusted { color: var(--green); }
+  .domain-unlisted { color: var(--yellow); }
+  .domain-suspicious { color: var(--red); }
+
+  aside {
+    width: 470px;
+    max-width: 48vw;
+    border-left: 1px solid var(--border);
+    background: var(--panel);
+    padding: 14px 16px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  aside h2 { margin: 0; font-size: 12.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }
+  .kv { display: grid; grid-template-columns: 108px 1fr; gap: 6px 10px; font-size: 12px; }
+  .kv .k { color: var(--muted); }
+  .kv .v { word-break: break-all; }
+  .action-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+  .ip-list { display: flex; flex-wrap: wrap; gap: 6px; }
+  .ip-chip {
+    background: rgba(56, 189, 248, 0.14);
+    color: var(--cyan);
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 11.5px;
+  }
+
+  .code-box {
+    border-top: 1px solid var(--border);
+    padding-top: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .code-summary { font-size: 11.5px; color: var(--muted); line-height: 1.45; }
+  .snippet-card {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    background: var(--bg);
+  }
+  .snippet-head {
+    padding: 5px 8px;
+    background: var(--panel-alt);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+  }
+  .snippet-file { color: var(--cyan); font-weight: 600; word-break: break-all; }
+  .snippet-kind { color: var(--muted); white-space: nowrap; }
+  .snippet-pre {
+    margin: 0;
+    padding: 6px 0;
+    overflow-x: auto;
+    font-size: 11.5px;
+    line-height: 1.45;
+  }
+  .code-line { display: flex; padding: 0 8px; white-space: pre; }
+  .code-line.hit { background: rgba(251, 191, 36, 0.16); color: #fff; }
+  .code-ln {
+    min-width: 36px;
+    padding-right: 10px;
+    color: var(--muted);
+    text-align: right;
+    user-select: none;
+  }
+
+  .rules-box {
+    border-top: 1px solid var(--border);
+    padding-top: 12px;
+    font-size: 11.5px;
+    color: var(--muted);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .add-domain-form { display: flex; gap: 6px; }
+  .add-domain-form input { min-width: 0; }
+  .feedback { font-size: 11px; min-height: 15px; color: var(--green); }
+  .feedback.err { color: var(--red); }
+  .rules-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    max-height: 170px;
+    overflow-y: auto;
+  }
+  .rule-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 11px;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+  }
+  .rule-chip.allow { color: var(--green); }
+  .rule-chip.builtin { color: var(--muted); }
+  .rule-chip.block { color: var(--red); }
+  .rule-del {
+    background: none;
+    border: none;
+    padding: 0 2px;
+    color: var(--muted);
+    font-size: 12px;
+    cursor: pointer;
+    line-height: 1;
+  }
+  .rule-del:hover { color: var(--red); border: none; }
+  .empty { color: var(--muted); font-size: 12px; padding: 14px 4px; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="title-group">
+      <div id="statusDot" class="dot"></div>
+      <div>
+        <h1>BOX LIVE NETWORK &amp; DNS TRAFFIC</h1>
+        <div id="policyNote" class="policy-note">Loading domain policy...</div>
+      </div>
+    </div>
+    <div class="stats">
+      <span class="pill active" data-filter="all">All (<span id="cAll">0</span>)</span>
+      <span class="pill blocked" data-filter="blocked">Blocked (<span id="cBlk">0</span>)</span>
+      <span class="pill suspicious" data-filter="suspicious">Suspicious (<span id="cSusp">0</span>)</span>
+      <span class="pill unlisted" data-filter="unlisted">Unlisted (<span id="cUnl">0</span>)</span>
+      <span class="pill trusted" data-filter="trusted">Trusted (<span id="cTr">0</span>)</span>
+    </div>
+  </header>
+
+  <div class="controls">
+    <input id="search" type="text" placeholder="Filter by domain, IP, proto, box name, workspace, or command...">
+    <label class="toggle"><input id="autoScroll" type="checkbox" checked> Auto-scroll (bottom)</label>
+    <select id="pcapSelect" title="Select captured PCAP file to export for Wireshark"></select>
+    <button id="exportPcapBtn" class="btn-pcap" title="Download PCAP capture for Wireshark">Export PCAP</button>
+    <button id="reloadBtn" title="Reload log, domain list, and PCAP captures">Reload</button>
+  </div>
+
+  <main>
+    <div class="feed-wrap" id="feedWrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Status</th>
+            <th>Proto</th>
+            <th>Host / Subdomain <button class="copy-btn" data-copy-col="domain" title="Copy all visible unique FQDNs">copy col</button></th>
+            <th>IP(s) <button class="copy-btn" data-copy-col="ips" title="Copy all visible unique IPs">copy col</button></th>
+            <th>Command <button class="copy-btn" data-copy-col="cmd" title="Copy all visible unique commands">copy col</button></th>
+            <th>Box <button class="copy-btn" data-copy-col="box" title="Copy all visible unique boxes">copy col</button></th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      <div id="emptyState" class="empty" style="display:none;">
+        No network events match the current filter. Run a box with <code>--net internet</code> or <code>--net local</code> to stream live traffic here.
+      </div>
+    </div>
+
+    <aside>
+      <h2>Event Details</h2>
+      <div id="detailBody" class="empty">Click any row to inspect network status (allowed vs blocked), resolved IP addresses, protocol/port, PCAP download, box, workspace, command, and originating code.</div>
+
+      <div class="code-box">
+        <h2>Code That Generated Traffic</h2>
+        <div id="codeBody" class="code-summary">Select an event to inspect matching source code or package manifests in its workspace.</div>
+      </div>
+
+      <div class="rules-box">
+        <h2>Allowed / Blocked Domain List</h2>
+        <div class="add-domain-form">
+          <input id="newDomainInput" type="text" placeholder="Add domain (e.g. api.example.com)">
+          <button id="addAllowBtn" class="btn-allow">+ Allow</button>
+          <button id="addBlockBtn" class="btn-block">Block</button>
+        </div>
+        <div id="ruleFeedback" class="feedback"></div>
+        <div id="rulesPath"></div>
+        <div id="rulesList" class="rules-list"></div>
+      </div>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast"></div>
+
+<script>
+  let events = [];
+  let pcaps = [];
+  let currentPolicy = null;
+  let filterStatus = 'all';
+  let selectedIdx = -1;
+  let codeReqSeq = 0;
+
+  const tbody = document.getElementById('tbody');
+  const feedWrap = document.getElementById('feedWrap');
+  const searchInput = document.getElementById('search');
+  const autoScroll = document.getElementById('autoScroll');
+  const detailBody = document.getElementById('detailBody');
+  const codeBody = document.getElementById('codeBody');
+  const emptyState = document.getElementById('emptyState');
+  const statusDot = document.getElementById('statusDot');
+  const newDomainInput = document.getElementById('newDomainInput');
+  const ruleFeedback = document.getElementById('ruleFeedback');
+  const pcapSelect = document.getElementById('pcapSelect');
+  const toastEl = document.getElementById('toast');
+  let toastTimer = null;
+
+  function showToast(msg) {
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1600);
+  }
+
+  async function copyText(text) {
+    const val = String(text ?? '');
+    if (!val || val === '-') return;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(val);
+      } else {
+        throw new Error('fallback');
+      }
+    } catch (_) {
+      const ta = document.createElement('textarea');
+      ta.value = val;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    const preview = val.length > 52 ? val.slice(0, 52) + '…' : val;
+    showToast('Copied: ' + preview);
+  }
+
+  function copyBtnHtml(value, title) {
+    if (!value || value === '-') return '';
+    return `<button class="copy-btn" data-copy="${esc(value)}" title="${esc(title || 'Copy')}">copy</button>`;
+  }
+
+  function esc(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function ipSummary(ips) {
+    if (!ips || ips.length === 0) return '-';
+    return ips.length === 1 ? ips[0] : `${ips[0]} (+${ips.length - 1})`;
+  }
+
+  function protoLabel(ev) {
+    const p = ev.proto || 'DNS';
+    if (p === 'DNS') return `DNS/${ev.qtype || 'A'}`;
+    if (ev.dst_port > 0) return `${p}:${ev.dst_port}`;
+    return p;
+  }
+
+  function fmtSize(bytes) {
+    if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+    if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return bytes + ' B';
+  }
+
+  function splitHost(domain) {
+    const clean = (domain || '').replace(/\.$/, '');
+    if (!clean || /^[0-9.:a-f]+$/i.test(clean)) {
+      return { sub: null, base: clean };
+    }
+    const parts = clean.split('.');
+    if (parts.length >= 3) {
+      return { sub: parts.slice(0, -2).join('.'), base: parts.slice(-2).join('.') };
+    }
+    return { sub: null, base: clean };
+  }
+
+  function formatHostHtml(domain) {
+    const { sub, base } = splitHost(domain);
+    if (sub) {
+      return `<span class="sub-part">${esc(sub)}.</span>${esc(base)}`;
+    }
+    return esc(base);
+  }
+
+  function parentDomain(domain) {
+    return splitHost(domain).sub ? splitHost(domain).base : null;
+  }
+
+  function showFeedback(msg, isErr) {
+    ruleFeedback.textContent = msg;
+    ruleFeedback.className = isErr ? 'feedback err' : 'feedback';
+  }
+
+  async function mutateDomainRule(domain, action) {
+    const cleaned = (domain || '').trim();
+    if (!cleaned) return;
+    try {
+      const res = await fetch('/api/domains', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain: cleaned, action }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        showFeedback(data.error || 'Failed to update domain list', true);
+        return;
+      }
+      const verb = action === 'block' ? 'Blocked' : action === 'remove' ? 'Removed' : 'Added to allowed list:';
+      showFeedback(`${verb} ${data.rule}`, false);
+      const keepIdx = selectedIdx;
+      await loadSnapshot(keepIdx);
+    } catch (e) {
+      showFeedback('Request failed: ' + e.message, true);
+    }
+  }
+
+  function matchesFilter(ev) {
+    if (filterStatus === 'blocked') {
+      if (!ev.blocked) return false;
+    } else if (filterStatus !== 'all' && ev.severity !== filterStatus) {
+      return false;
+    }
+    const q = searchInput.value.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      (ev.domain || '').toLowerCase().includes(q) ||
+      (ev.proto || '').toLowerCase().includes(q) ||
+      String(ev.dst_port || '').includes(q) ||
+      (ev.block_reason || '').toLowerCase().includes(q) ||
+      (ev.box || '').toLowerCase().includes(q) ||
+      (ev.env || '').toLowerCase().includes(q) ||
+      (ev.workspace || '').toLowerCase().includes(q) ||
+      (ev.cmd || '').toLowerCase().includes(q) ||
+      (ev.dns_server || '').toLowerCase().includes(q) ||
+      (ev.ips || []).some(ip => ip.toLowerCase().includes(q)) ||
+      (ev.cnames || []).some(c => c.toLowerCase().includes(q))
+    );
+  }
+
+  function updateCounts() {
+    let susp = 0, unl = 0, tr = 0, blk = 0;
+    for (const ev of events) {
+      if (ev.blocked) blk++;
+      if (ev.severity === 'suspicious') susp++;
+      else if (ev.severity === 'trusted') tr++;
+      else unl++;
+    }
+    document.getElementById('cAll').textContent = events.length;
+    document.getElementById('cBlk').textContent = blk;
+    document.getElementById('cSusp').textContent = susp;
+    document.getElementById('cUnl').textContent = unl;
+    document.getElementById('cTr').textContent = tr;
+  }
+
+  function makeRow(ev, idx) {
+    const tr = document.createElement('tr');
+    const classes = [`verdict-${ev.severity}`];
+    if (ev.blocked) classes.push('row-blocked');
+    if (idx === selectedIdx) classes.push('selected');
+    tr.className = classes.join(' ');
+    tr.dataset.idx = idx;
+
+    const blockedBadge = ev.blocked
+      ? `<span class="badge blocked" title="${esc(ev.block_reason || 'Blocked by network interface')}">BLOCKED</span>`
+      : '';
+    const statusText = (ev.blocked ? 'BLOCKED ' : '') + (ev.label || '');
+    const protoText = protoLabel(ev);
+    const fullIps = (ev.ips || []).join(', ');
+    const ipDisp = ipSummary(ev.ips);
+
+    tr.innerHTML = `
+      <td class="time-cell" data-dblcopy="${esc(ev.datetime || ev.time)}"><span class="cell-wrap"><span class="cell-val">${esc(ev.time)}</span>${copyBtnHtml(ev.datetime || ev.time, 'Copy timestamp')}</span></td>
+      <td data-dblcopy="${esc(statusText)}"><span class="cell-wrap">${blockedBadge}<span class="badge ${esc(ev.severity)}">${esc(ev.label)}</span>${copyBtnHtml(statusText, 'Copy status')}</span></td>
+      <td class="type-cell" data-dblcopy="${esc(protoText)}"><span class="cell-wrap"><span class="cell-val">${esc(protoText)}</span>${copyBtnHtml(protoText, 'Copy protocol')}</span></td>
+      <td class="domain-cell domain-${esc(ev.severity)}" title="${esc(ev.domain)}" data-dblcopy="${esc(ev.domain)}"><span class="cell-wrap"><span class="cell-val">${formatHostHtml(ev.domain)}</span>${copyBtnHtml(ev.domain, 'Copy full host (FQDN)')}</span></td>
+      <td class="ip-cell" title="${esc(fullIps)}" data-dblcopy="${esc(fullIps)}"><span class="cell-wrap"><span class="cell-val">${esc(ipDisp)}</span>${copyBtnHtml(fullIps, 'Copy all IPs')}</span></td>
+      <td class="cmd-cell" title="${esc(ev.cmd)}" data-dblcopy="${esc(ev.cmd)}"><span class="cell-wrap"><span class="cell-val">${esc(ev.cmd)}</span>${copyBtnHtml(ev.cmd, 'Copy command')}</span></td>
+      <td data-dblcopy="${esc(ev.box)}"><span class="cell-wrap"><span class="cell-val">${esc(ev.box)}</span>${copyBtnHtml(ev.box, 'Copy box name')}</span></td>
+    `;
+    tr.addEventListener('click', (e) => {
+      const btn = e.target.closest('button.copy-btn');
+      if (btn) {
+        e.stopPropagation();
+        copyText(btn.dataset.copy);
+        return;
+      }
+      if (window.getSelection && window.getSelection().toString()) return;
+      selectEvent(idx);
+    });
+    tr.addEventListener('dblclick', (e) => {
+      const td = e.target.closest('td[data-dblcopy]');
+      if (td && td.dataset.dblcopy) {
+        copyText(td.dataset.dblcopy);
+      }
+    });
+    return tr;
+  }
+
+  function renderAll() {
+    updateCounts();
+    tbody.innerHTML = '';
+    let shown = 0;
+    for (let i = 0; i < events.length; i++) {
+      if (matchesFilter(events[i])) {
+        tbody.appendChild(makeRow(events[i], i));
+        shown++;
+      }
+    }
+    emptyState.style.display = shown === 0 ? 'block' : 'none';
+    if (autoScroll.checked) {
+      feedWrap.scrollTop = feedWrap.scrollHeight;
+    }
+  }
+
+  function appendEvent(ev) {
+    const idx = events.length;
+    events.push(ev);
+    updateCounts();
+    if (ev.pcap_file && !pcaps.some(p => p.name === ev.pcap_file)) {
+      refreshPcaps();
+    }
+    if (matchesFilter(ev)) {
+      emptyState.style.display = 'none';
+      tbody.appendChild(makeRow(ev, idx));
+      if (autoScroll.checked) {
+        feedWrap.scrollTop = feedWrap.scrollHeight;
+      }
+    }
+  }
+
+  async function refreshPcaps() {
+    try {
+      const res = await fetch('/api/pcaps');
+      const data = await res.json();
+      renderPcaps(data.pcaps || []);
+    } catch (_) {}
+  }
+
+  function renderPcaps(list) {
+    pcaps = list;
+    const prev = pcapSelect.value;
+    pcapSelect.innerHTML = '';
+    if (!list.length) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'No PCAP captures yet';
+      pcapSelect.appendChild(opt);
+      return;
+    }
+    for (const p of list) {
+      const opt = document.createElement('option');
+      opt.value = p.name;
+      opt.textContent = `${p.name} (${fmtSize(p.size)})`;
+      pcapSelect.appendChild(opt);
+    }
+    if (prev && list.some(p => p.name === prev)) {
+      pcapSelect.value = prev;
+    }
+  }
+
+  async function loadCodeProvenance(ev) {
+    const seq = ++codeReqSeq;
+    codeBody.innerHTML = '<div class="code-summary">Scanning workspace for code references...</div>';
+    const qs = new URLSearchParams({
+      workspace: ev.workspace || '',
+      domain: ev.domain || '',
+      cmd: ev.cmd || '',
+      ips: (ev.ips || []).join(','),
+    });
+    try {
+      const res = await fetch('/api/code?' + qs.toString());
+      const data = await res.json();
+      if (seq !== codeReqSeq) return;
+
+      let html = `<div class="code-summary">${esc(data.summary)}</div>`;
+      if (data.command_direct) {
+        html += `<div class="snippet-card">
+          <div class="snippet-head"><span class="snippet-file">command line</span><span class="snippet-kind">direct invocation</span></div>
+          <pre class="snippet-pre"><div class="code-line hit"><span class="code-ln">$</span><span>${esc(ev.cmd)}</span></div></pre>
+        </div>`;
+      }
+      for (const m of (data.matches || [])) {
+        const linesHtml = (m.snippet || []).map(l =>
+          `<div class="code-line${l.is_match ? ' hit' : ''}"><span class="code-ln">${esc(l.line_no)}</span><span>${esc(l.text)}</span></div>`
+        ).join('');
+        html += `<div class="snippet-card">
+          <div class="snippet-head">
+            <span class="snippet-file">${esc(m.file)}:${esc(m.line)}</span>
+            <span class="snippet-kind">${esc(m.kind)}</span>
+          </div>
+          <pre class="snippet-pre">${linesHtml}</pre>
+        </div>`;
+      }
+      codeBody.innerHTML = html;
+    } catch (e) {
+      if (seq !== codeReqSeq) return;
+      codeBody.innerHTML = `<div class="code-summary">Failed to inspect workspace code: ${esc(e.message)}</div>`;
+    }
+  }
+
+  function selectEvent(idx) {
+    selectedIdx = idx;
+    for (const tr of tbody.querySelectorAll('tr.selected')) tr.classList.remove('selected');
+    const row = tbody.querySelector(`tr[data-idx="${idx}"]`);
+    if (row) row.classList.add('selected');
+
+    const ev = events[idx];
+    if (!ev) return;
+    const ipsHtml = (ev.ips && ev.ips.length)
+      ? `<div class="ip-list">${ev.ips.map(ip => `<span class="ip-chip" data-copy="${esc(ip)}" title="Click to copy IP">${esc(ip)}${copyBtnHtml(ip, 'Copy IP')}</span>`).join('')}</div>`
+      : '<span style="color:var(--muted)">(no IP answer captured)</span>';
+
+    const { sub, base } = splitHost(ev.domain);
+    const parent = sub ? base : null;
+    const inUserAllow = currentPolicy && (
+      (currentPolicy.user_allowed || []).includes(ev.domain.toLowerCase()) ||
+      (currentPolicy.user_allowed || []).includes('=' + ev.domain.toLowerCase())
+    );
+    const inUserBlock = currentPolicy && (currentPolicy.blocked || []).includes(ev.domain.toLowerCase());
+
+    let actions = '';
+    if (ev.severity !== 'trusted') {
+      actions += `<button class="btn-allow" id="quickAllowBtn">+ Allow ${esc(ev.domain)}</button>`;
+      if (parent && parent !== ev.domain.toLowerCase()) {
+        actions += `<button class="btn-allow" id="quickAllowParentBtn">+ Allow *.${esc(parent)}</button>`;
+      }
+    }
+    if (!inUserBlock) {
+      actions += `<button class="btn-block" id="quickBlockBtn">Block ${esc(ev.domain)}</button>`;
+    }
+    if (inUserAllow || inUserBlock) {
+      actions += `<button class="btn-muted" id="quickRemoveBtn">Remove user rule</button>`;
+    }
+    if (ev.pcap_file) {
+      actions += `<a class="btn btn-pcap" href="/api/pcap?file=${encodeURIComponent(ev.pcap_file)}" download="${esc(ev.pcap_file)}">Download PCAP</a>`;
+    }
+
+    const netActionHtml = ev.blocked
+      ? `<span class="badge blocked">BLOCKED BY INTERFACE</span> <span style="color:var(--purple)">${esc(ev.block_reason || 'blocked by network policy')}</span>`
+      : `<span class="badge allowed-net">ALLOWED</span>`;
+
+    const cnameRow = (ev.cnames && ev.cnames.length)
+      ? `<div class="k">CNAME Chain</div><div class="v"><div class="ip-list">${ev.cnames.map(c => `<span class="ip-chip" data-copy="${esc(c)}" title="Click to copy CNAME">${esc(c)}${copyBtnHtml(c, 'Copy CNAME')}</span>`).join('')}</div></div>`
+      : '';
+    const subRow = sub
+      ? `<div class="k">Subdomain</div><div class="v"><span class="kv-val-wrap"><strong>${esc(sub)}</strong> <span style="color:var(--muted)">(base: ${esc(base)})</span>${copyBtnHtml(sub, 'Copy subdomain')}</span></div>`
+      : '';
+
+    detailBody.className = 'kv';
+    detailBody.innerHTML = `
+      <div class="k">Full Host</div><div class="v"><span class="kv-val-wrap"><strong class="domain-${esc(ev.severity)}">${esc(ev.domain)}</strong>${copyBtnHtml(ev.domain, 'Copy full host (FQDN)')}</span></div>
+      ${subRow}
+      ${cnameRow}
+      <div class="k">Interface</div><div class="v">${netActionHtml}</div>
+      <div class="k">Domain List</div><div class="v"><span class="badge ${esc(ev.severity)}">${esc(ev.label)}</span> ${esc(ev.reason || 'not in domain list')}</div>
+      <div class="k">Actions</div><div class="v"><div class="action-row">${actions}</div></div>
+      <div class="k">Protocol</div><div class="v"><span class="kv-val-wrap"><span>${esc(protoLabel(ev))}</span>${copyBtnHtml(protoLabel(ev), 'Copy protocol')}</span></div>
+      <div class="k">IP Address(es)</div><div class="v">${ipsHtml}</div>
+      <div class="k">DNS Server</div><div class="v"><span class="kv-val-wrap"><span>${esc(ev.dns_server || '-')}</span>${copyBtnHtml(ev.dns_server, 'Copy DNS server')}</span></div>
+      <div class="k">Box Name</div><div class="v"><span class="kv-val-wrap"><span>${esc(ev.box)}</span>${copyBtnHtml(ev.box, 'Copy box name')}</span></div>
+      <div class="k">Environment</div><div class="v"><span class="kv-val-wrap"><span>${esc(ev.env)}</span>${copyBtnHtml(ev.env, 'Copy environment')}</span></div>
+      <div class="k">Workspace</div><div class="v"><span class="kv-val-wrap"><span>${esc(ev.workspace)}</span>${copyBtnHtml(ev.workspace, 'Copy workspace')}</span></div>
+      <div class="k">Command</div><div class="v"><span class="kv-val-wrap"><code>${esc(ev.cmd)}</code>${copyBtnHtml(ev.cmd, 'Copy command')}</span></div>
+      <div class="k">Timestamp</div><div class="v"><span class="kv-val-wrap"><span>${esc(ev.datetime)} (epoch ${esc(ev.ts)})</span>${copyBtnHtml(ev.datetime, 'Copy timestamp')}</span></div>
+    `;
+
+    for (const el of detailBody.querySelectorAll('[data-copy]')) {
+      el.addEventListener('click', (e) => {
+        e.stopPropagation();
+        copyText(el.dataset.copy);
+      });
+    }
+
+    const qAllow = document.getElementById('quickAllowBtn');
+    if (qAllow) qAllow.addEventListener('click', () => mutateDomainRule(ev.domain, 'allow'));
+    const qAllowParent = document.getElementById('quickAllowParentBtn');
+    if (qAllowParent) qAllowParent.addEventListener('click', () => mutateDomainRule(parent, 'allow'));
+    const qBlock = document.getElementById('quickBlockBtn');
+    if (qBlock) qBlock.addEventListener('click', () => mutateDomainRule(ev.domain, 'block'));
+    const qRemove = document.getElementById('quickRemoveBtn');
+    if (qRemove) qRemove.addEventListener('click', () => mutateDomainRule(ev.domain, 'remove'));
+
+    loadCodeProvenance(ev);
+  }
+
+  function renderPolicy(policy) {
+    currentPolicy = policy;
+    document.getElementById('policyNote').textContent = `Domains: ${policy.source}`;
+    document.getElementById('rulesPath').textContent = `File: ${policy.file}`;
+    const list = document.getElementById('rulesList');
+    list.innerHTML = '';
+
+    for (const b of (policy.blocked || [])) {
+      const chip = document.createElement('span');
+      chip.className = 'rule-chip block';
+      chip.innerHTML = `<span>!${esc(b)}</span><button class="rule-del" title="Remove rule">&times;</button>`;
+      chip.querySelector('button').addEventListener('click', () => mutateDomainRule(b, 'remove'));
+      list.appendChild(chip);
+    }
+    for (const a of (policy.user_allowed || [])) {
+      const chip = document.createElement('span');
+      chip.className = 'rule-chip allow';
+      chip.innerHTML = `<span>${esc(a)}</span><button class="rule-del" title="Remove rule">&times;</button>`;
+      chip.querySelector('button').addEventListener('click', () => mutateDomainRule(a, 'remove'));
+      list.appendChild(chip);
+    }
+    for (const d of (policy.builtin_allowed || [])) {
+      const chip = document.createElement('span');
+      chip.className = 'rule-chip builtin';
+      chip.title = 'Built-in dev registry';
+      chip.textContent = d;
+      list.appendChild(chip);
+    }
+  }
+
+  async function loadSnapshot(preferIdx) {
+    const res = await fetch('/api/events');
+    const data = await res.json();
+    events = data.events || [];
+    if (data.policy) renderPolicy(data.policy);
+    renderPcaps(data.pcaps || []);
+    renderAll();
+    if (events.length > 0) {
+      const idx = (typeof preferIdx === 'number' && preferIdx >= 0 && preferIdx < events.length)
+        ? preferIdx
+        : (selectedIdx >= 0 && selectedIdx < events.length ? selectedIdx : events.length - 1);
+      selectEvent(idx);
+    }
+  }
+
+  function connectStream() {
+    const es = new EventSource('/api/stream');
+    es.onopen = () => statusDot.classList.remove('offline');
+    es.onerror = () => statusDot.classList.add('offline');
+    es.onmessage = (msg) => {
+      try {
+        const ev = JSON.parse(msg.data);
+        appendEvent(ev);
+      } catch (_) {}
+    };
+  }
+
+  for (const btn of document.querySelectorAll('th button[data-copy-col]')) {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const col = btn.dataset.copyCol;
+      const seen = new Set();
+      const vals = [];
+      for (const ev of events) {
+        if (!matchesFilter(ev)) continue;
+        if (col === 'ips') {
+          for (const ip of (ev.ips || [])) {
+            if (ip && !seen.has(ip)) { seen.add(ip); vals.push(ip); }
+          }
+        } else {
+          const v = ev[col];
+          if (v && !seen.has(v)) { seen.add(v); vals.push(v); }
+        }
+      }
+      if (vals.length) {
+        copyText(vals.join('\n'));
+      } else {
+        showToast('Nothing to copy in column');
+      }
+    });
+  }
+
+  for (const pill of document.querySelectorAll('.pill')) {
+    pill.addEventListener('click', () => {
+      for (const p of document.querySelectorAll('.pill')) p.classList.remove('active');
+      pill.classList.add('active');
+      filterStatus = pill.dataset.filter;
+      renderAll();
+    });
+  }
+  searchInput.addEventListener('input', renderAll);
+  document.getElementById('reloadBtn').addEventListener('click', () => loadSnapshot(selectedIdx));
+  document.getElementById('exportPcapBtn').addEventListener('click', () => {
+    const f = pcapSelect.value;
+    if (!f) {
+      showFeedback('No PCAP capture available yet — run a box with --net internet or --net local.', true);
+      return;
+    }
+    window.location.href = '/api/pcap?file=' + encodeURIComponent(f);
+  });
+  document.getElementById('addAllowBtn').addEventListener('click', () => {
+    mutateDomainRule(newDomainInput.value, 'allow');
+    newDomainInput.value = '';
+  });
+  document.getElementById('addBlockBtn').addEventListener('click', () => {
+    mutateDomainRule(newDomainInput.value, 'block');
+    newDomainInput.value = '';
+  });
+  newDomainInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      mutateDomainRule(newDomainInput.value, 'allow');
+      newDomainInput.value = '';
+    }
+  });
+
+  loadSnapshot().then(connectStream);
+</script>
+</body>
+</html>
