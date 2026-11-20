@@ -44,12 +44,20 @@ fn image_exists(bin: &str, use_sudo: bool, tag: &str) -> bool {
 }
 
 fn generate_containerfile(base_preset: Preset, presets: &[Preset]) -> String {
+    if base_preset == Preset::Alpine {
+        return format!(
+            "FROM {}\nRUN apk add --no-cache ca-certificates curl iputils vim\n",
+            base_preset.image()
+        );
+    }
+
     let mut containerfile = format!(
         "FROM {}\nENV DEBIAN_FRONTEND=noninteractive\n",
         base_preset.image()
     );
 
-    let mut apt_packages: Vec<&str> = Vec::new();
+    // Minimum base tools included in every Debian-based preset image
+    let mut apt_packages: Vec<&str> = vec!["ca-certificates", "curl", "iputils-ping", "vim"];
     let mut extra_run_steps: Vec<&str> = Vec::new();
     let has_latex = presets.contains(&Preset::Latex);
 
@@ -71,7 +79,7 @@ fn generate_containerfile(base_preset: Preset, presets: &[Preset]) -> String {
                 apt_packages.extend(["nodejs", "npm"]);
             }
             Preset::Rust => {
-                apt_packages.extend(["curl", "build-essential", "pkg-config", "libssl-dev"]);
+                apt_packages.extend(["build-essential", "pkg-config", "libssl-dev"]);
                 extra_run_steps.push(
                     "ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH\n\
                      RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path && chmod -R a+rX /usr/local/rustup /usr/local/cargo",
@@ -88,14 +96,12 @@ fn generate_containerfile(base_preset: Preset, presets: &[Preset]) -> String {
         }
     }
 
-    if !apt_packages.is_empty() {
-        apt_packages.sort_unstable();
-        apt_packages.dedup();
-        containerfile.push_str(&format!(
-            "RUN apt-get update && apt-get install -y --no-install-recommends {} && rm -rf /var/lib/apt/lists/*\n",
-            apt_packages.join(" ")
-        ));
-    }
+    apt_packages.sort_unstable();
+    apt_packages.dedup();
+    containerfile.push_str(&format!(
+        "RUN apt-get update && apt-get install -y --no-install-recommends {} && rm -rf /var/lib/apt/lists/*\n",
+        apt_packages.join(" ")
+    ));
 
     if has_latex {
         // Pre-populate fontconfig and luaotfload font databases into TEXMFSYSVAR inside the image
@@ -131,13 +137,7 @@ pub fn build_combined_image(cli: &Cli, presets: &[Preset]) -> (String, String) {
         .collect::<Vec<_>>()
         .join("+");
 
-    // Single non-LaTeX presets use upstream images directly; LaTeX builds a local cached image
-    // with system fonts (Liberation/DejaVu) and a prebuilt luaotfload font database.
-    if unique.len() == 1 && unique[0] != Preset::Latex {
-        return (unique[0].image().to_string(), env_label);
-    }
-
-    if unique.contains(&Preset::Alpine) {
+    if unique.len() > 1 && unique.contains(&Preset::Alpine) {
         eprintln!(
             "ERROR: Cannot combine `alpine` (musl/apk) with Debian-based presets (python, rust, node, latex)."
         );
@@ -162,7 +162,7 @@ pub fn build_combined_image(cli: &Cli, presets: &[Preset]) -> (String, String) {
     let containerfile = generate_containerfile(base_preset, &unique);
 
     println!(
-        "[box] Building environment image '{}' (base: {})...",
+        "[box] Building environment image '{}' (base: {}, includes curl/ping/vim)...",
         tag,
         base_preset.as_str()
     );
@@ -214,10 +214,26 @@ mod tests {
     }
 
     #[test]
+    fn base_presets_include_curl_ping_and_vim() {
+        let rust_cf = generate_containerfile(Preset::Rust, &[Preset::Rust]);
+        assert!(rust_cf.contains("curl"));
+        assert!(rust_cf.contains("iputils-ping"));
+        assert!(rust_cf.contains("vim"));
+
+        let alpine_cf = generate_containerfile(Preset::Alpine, &[Preset::Alpine]);
+        assert!(alpine_cf.contains("apk add --no-cache"));
+        assert!(alpine_cf.contains("curl"));
+        assert!(alpine_cf.contains("iputils"));
+        assert!(alpine_cf.contains("vim"));
+    }
+
+    #[test]
     fn latex_containerfile_installs_liberation_fonts_and_prebuilds_luaotfload_db() {
         let cf = generate_containerfile(Preset::Latex, &[Preset::Latex, Preset::Python]);
         assert!(cf.contains("fonts-liberation"));
         assert!(cf.contains("fontconfig"));
+        assert!(cf.contains("iputils-ping"));
+        assert!(cf.contains("vim"));
         assert!(cf.contains("luaotfload-tool --update --force"));
         assert!(cf.contains("python3"));
     }

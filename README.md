@@ -122,8 +122,8 @@ Events are appended as JSON Lines to `${XDG_DATA_HOME:-$HOME/.local/share}/box/d
 
 Pass one or more `--preset` values (`alpine`, `latex`, `node`, `python`, `rust`):
 
-- **Single preset** uses the upstream base image directly (defaults to `rust` when neither `--preset` nor `--image` is given) — except `latex`, which builds a cached `localhost/box-env:latex` image with `fontconfig`, `fonts-liberation`, `fonts-dejavu-core`, and a pre-generated `luaotfload` font database baked into `TEXMFSYSVAR`.
-- **Multiple presets** (e.g. `--preset latex,python`) automatically select the heaviest preset as the `FROM` base (`latex > rust > node > python > alpine`), generate an in-memory `Containerfile` installing the remaining toolchains (plus system fonts & prebuilt `luaotfload` cache whenever `latex` is included), and build/cache it as `localhost/box-env:<sorted-presets>` (use `--rebuild` to force a rebuild, including with `--attach <box> --rebuild`).
+- **Every preset** (`alpine`, `latex`, `node`, `python`, `rust` — single or combined) builds a locally cached `localhost/box-env:<sorted-presets>` image that includes `ca-certificates`, `curl`, `ping` (`iputils-ping` / `iputils`), and `vim` out of the box (plus `fontconfig`, `fonts-liberation`, `fonts-dejavu-core`, and a prebuilt `luaotfload` font database whenever `latex` is included).
+- **Multiple presets** (e.g. `--preset latex,python`) automatically select the heaviest preset as the `FROM` base (`latex > rust > node > python > alpine`) and install the remaining toolchains (use `--rebuild` to force a rebuild, including with `--attach <box> --rebuild`).
 - At runtime, `TEXMFVAR=/opt/venv/texmf-var` and `XDG_CACHE_HOME=/opt/venv/cache` keep TeX Live / `luaotfload` / `fontconfig` caches persistent across restarts when `/opt/venv` is mounted.
 - `alpine` (musl/apk) cannot be combined with Debian-based presets.
 
@@ -206,9 +206,10 @@ box --verify
 box --inspect univ                         # Image, Kata vs libkrun proof, OS, installed tools
 box --inspect univ -v                      # Same, plus full list of OS & Python packages
 
-# List persisted boxes (created with --keep) and attach/reuse them
+# List persisted boxes (created with --keep) and attach/spawn from them
 box --list
-box --attach my-rust                       # Attach if running, or start & attach if stopped
-box --attach my-rust --mount-cwd           # Mount your current directory at /workspace
+box --attach my-rust                       # Starts if stopped; spawns a fresh sibling VM if already running
+box --attach my-rust --new                 # Always spawn a fresh sibling VM with the same config
+box --attach my-rust --same-tty            # Reconnect directly to a detached running process's TTY
 box --attach my-rust --mount-cwd --rw      # Mount current directory read-write at /workspace
 ```

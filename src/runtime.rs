@@ -36,6 +36,8 @@ struct BoxInspect {
     cmd: Vec<String>,
     keep_id: bool,
     cmd_file: Option<PathBuf>,
+    managed: bool,
+    is_toolbox: bool,
 }
 
 struct BoxSpec {
@@ -876,6 +878,12 @@ fn parse_inspect_output(raw: &str) -> Option<BoxInspect> {
         .map(|s| s == "keep-id")
         .unwrap_or(false);
     let cmd_file = clean_template_val(cols.get(13)).map(PathBuf::from);
+    let managed = clean_template_val(cols.get(14))
+        .map(|s| s == "true")
+        .unwrap_or(false);
+    let is_toolbox = clean_template_val(cols.get(15))
+        .map(|s| s == "true")
+        .unwrap_or(false);
 
     Some(BoxInspect {
         running,
@@ -892,16 +900,25 @@ fn parse_inspect_output(raw: &str) -> Option<BoxInspect> {
         cmd,
         keep_id,
         cmd_file,
+        managed,
+        is_toolbox,
     })
 }
 
 fn inspect_box(bin: &str, use_sudo: bool, target: &str) -> BoxInspect {
-    let fmt = "{{.State.Running}}\t{{.Name}}\t{{.Config.Image}}\t{{.HostConfig.NetworkMode}}\t{{index .Config.Labels \"box.preset\"}}\t{{index .Config.Labels \"box.workspace\"}}\t{{index .Config.Labels \"box.runtime\"}}\t{{index .Config.Labels \"box.net\"}}\t{{index .Config.Labels \"box.rw\"}}\t{{index .Config.Labels \"box.venv\"}}\t{{index .Config.Labels \"box.pcap\"}}\t{{range .Config.Cmd}}{{.}} {{end}}\t{{index .Config.Labels \"box.userns\"}}\t{{index .Config.Labels \"box.cmdfile\"}}";
+    let fmt = "{{.State.Running}}\t{{.Name}}\t{{.Config.Image}}\t{{.HostConfig.NetworkMode}}\t{{index .Config.Labels \"box.preset\"}}\t{{index .Config.Labels \"box.workspace\"}}\t{{index .Config.Labels \"box.runtime\"}}\t{{index .Config.Labels \"box.net\"}}\t{{index .Config.Labels \"box.rw\"}}\t{{index .Config.Labels \"box.venv\"}}\t{{index .Config.Labels \"box.pcap\"}}\t{{range .Config.Cmd}}{{.}} {{end}}\t{{index .Config.Labels \"box.userns\"}}\t{{index .Config.Labels \"box.cmdfile\"}}\t{{index .Config.Labels \"box.managed\"}}\t{{index .Config.Labels \"com.github.containers.toolbox\"}}";
     let output = container_cmd(bin, use_sudo)
         .args(["container", "inspect", "--format", fmt, target])
         .output()
         .unwrap_or_else(|e| {
-            eprintln!("Failed to inspect box '{}' via {}: {}", target, bin, e);
+            if e.kind() == std::io::ErrorKind::NotFound && bin == "nerdctl" {
+                eprintln!(
+                    "ERROR: `nerdctl` not found (`--runtime kata` requires nerdctl + containerd + Kata Containers).\n\
+                     On Fedora Atomic, omit `--runtime kata` (default `--runtime krun` uses podman + libkrun KVM microVMs)."
+                );
+            } else {
+                eprintln!("Failed to inspect box '{}' via {}: {}", target, bin, e);
+            }
             process::exit(1);
         });
 
@@ -923,9 +940,37 @@ fn inspect_box(bin: &str, use_sudo: bool, target: &str) -> BoxInspect {
     })
 }
 
+fn pick_free_local_port(preferred: u16) -> u16 {
+    for p in preferred..preferred.saturating_add(50) {
+        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+            return p;
+        }
+    }
+    preferred
+}
+
 pub fn attach_box(cli: &Cli, target: &str) {
+    if cli.runtime == VmRuntime::Kata {
+        check_kata_installed();
+    }
     let bin = cli.runtime.container_bin();
     let info = inspect_box(bin, cli.sudo, target);
+    if !info.managed {
+        let kind = if info.is_toolbox {
+            "a Fedora Toolbox container"
+        } else {
+            "an external (non-box) container"
+        };
+        eprintln!(
+            "SAFETY ABORT: Container '{}' is {} (missing label `box.managed=true`).",
+            info.name, kind
+        );
+        eprintln!("Refusing to attach/recreate it so your existing container is not modified or deleted.");
+        eprintln!(
+            "Run `box --list` to see box-managed VMs, or create a new box with `--keep --name <new-name>`."
+        );
+        process::exit(1);
+    }
     let runtime = info.runtime.unwrap_or(cli.runtime);
     let saved_net = info
         .net
@@ -939,6 +984,83 @@ pub fn attach_box(cli: &Cli, target: &str) {
     } else {
         None
     };
+
+    let resolve_attach_dir = |req: &Option<PathBuf>| -> PathBuf {
+        if let Some(raw_dir) = req {
+            validate_target_dir(raw_dir)
+        } else if info.workspace != "-" {
+            validate_target_dir(Path::new(&info.workspace))
+        } else {
+            validate_target_dir(
+                &env::current_dir().expect("Failed to determine current working directory"),
+            )
+        }
+    };
+
+    let resolve_attach_cmd = |env_label: &str| -> Vec<String> {
+        if !cli.cmd.is_empty() {
+            cli.cmd.clone()
+        } else if !info.cmd.is_empty()
+            && !info.cmd.iter().any(|tok| tok.contains("/tmp/.box_bashrc"))
+        {
+            info.cmd.clone()
+        } else if env_label == "alpine" {
+            vec!["sh".to_string()]
+        } else {
+            vec!["bash".to_string()]
+        }
+    };
+
+    // Spawn a fresh sibling microVM (inheriting the existing box's image, preset, mounts,
+    // /opt/venv, and network — without killing or hijacking the running process) whenever:
+    //   1. The target box is already running (unless `--same-tty` is explicitly passed), OR
+    //   2. `--new` is explicitly passed.
+    if (info.running && !cli.same_tty) || cli.new_vm {
+        let target_dir = resolve_attach_dir(&requested_dir);
+        let (image, env_label) = if cli.rebuild {
+            let presets = parse_presets_from_env_label(&info.preset);
+            if !presets.is_empty() {
+                build_combined_image(cli, &presets)
+            } else {
+                (info.image.clone(), info.preset.clone())
+            }
+        } else {
+            (info.image.clone(), info.preset.clone())
+        };
+
+        let sibling_name = cli.name.clone().unwrap_or_else(|| {
+            format!("{}-{}", info.name, now_epoch() % 10_000)
+        });
+        let effective_cmd = resolve_attach_cmd(&env_label);
+        let mode_label = format!("NEW VM FROM {}", info.name);
+
+        let sibling_port = if info.running && effective_net == NetMode::Local {
+            pick_free_local_port(cli.port)
+        } else {
+            cli.port
+        };
+
+        let spec = BoxSpec {
+            box_name: sibling_name,
+            image,
+            env_label,
+            target_dir,
+            effective_cmd,
+            runtime,
+            net: effective_net,
+            rw: cli.rw || info.rw,
+            keep: cli.keep,
+            venv: if cli.ephemeral { None } else { info.venv },
+            port: sibling_port,
+            expose_port: cli.expose_port,
+            memory: cli.memory.clone(),
+            cpus: cli.cpus,
+            pids_limit: cli.pids_limit,
+            sudo: cli.sudo,
+            upstream_dns: cli.upstream_dns.clone(),
+        };
+        launch_box(&spec, &mode_label);
+    }
 
     let needs_net_change = effective_net != saved_net;
     let needs_local_audit_upgrade = runtime == VmRuntime::Krun
@@ -962,24 +1084,17 @@ pub fn attach_box(cli: &Cli, target: &str) {
         None => false,
     };
 
-    let wants_recreate = cli.rebuild
-        || needs_net_change
-        || needs_local_audit_upgrade
-        || needs_cmd_tracker_upgrade
-        || needs_rw_upgrade
-        || needs_dir_change
-        || (requested_dir.is_some() && needs_userns_upgrade);
+    let wants_recreate = !info.running
+        && (cli.rebuild
+            || needs_net_change
+            || needs_local_audit_upgrade
+            || needs_cmd_tracker_upgrade
+            || needs_rw_upgrade
+            || needs_dir_change
+            || (requested_dir.is_some() && needs_userns_upgrade));
 
     if wants_recreate {
-        let target_dir = if let Some(raw_dir) = requested_dir {
-            validate_target_dir(&raw_dir)
-        } else if info.workspace != "-" {
-            validate_target_dir(Path::new(&info.workspace))
-        } else {
-            validate_target_dir(
-                &env::current_dir().expect("Failed to determine current working directory"),
-            )
-        };
+        let target_dir = resolve_attach_dir(&requested_dir);
 
         let (image, env_label) = if cli.rebuild {
             let presets = parse_presets_from_env_label(&info.preset);
@@ -1017,17 +1132,7 @@ pub fn attach_box(cli: &Cli, target: &str) {
             process::exit(1);
         }
 
-        let effective_cmd = if !cli.cmd.is_empty() {
-            cli.cmd.clone()
-        } else if !info.cmd.is_empty()
-            && !info.cmd.iter().any(|tok| tok.contains("/tmp/.box_bashrc"))
-        {
-            info.cmd.clone()
-        } else if env_label == "alpine" {
-            vec!["sh".to_string()]
-        } else {
-            vec!["bash".to_string()]
-        };
+        let effective_cmd = resolve_attach_cmd(&env_label);
 
         let spec = BoxSpec {
             box_name: info.name,

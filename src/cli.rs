@@ -115,9 +115,17 @@ pub struct Cli {
     #[arg(long, visible_alias = "info", value_name = "BOX")]
     pub inspect: Option<String>,
 
-    /// Attach to an existing box by name or ID (attaches if running, starts & attaches if stopped)
+    /// Attach to an existing box by name or ID (spawns a fresh sibling VM if already running; starts & enters if stopped)
     #[arg(short = 'a', long, value_name = "BOX")]
     pub attach: Option<String>,
+
+    /// With --attach, always spawn a new ephemeral sibling VM with the same configuration (even if stopped)
+    #[arg(long = "new", default_value_t = false)]
+    pub new_vm: bool,
+
+    /// With --attach on a running box, attach directly to its existing TTY process instead of spawning a new VM
+    #[arg(long, default_value_t = false)]
+    pub same_tty: bool,
 
     /// With --attach, mount the current working directory at /workspace (recreates container while preserving image, net, and /opt/venv)
     #[arg(long, default_value_t = false)]
