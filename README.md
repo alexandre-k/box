@@ -1,3 +1,5 @@
+[![Rust](https://github.com/alexandre-k/box/actions/workflows/rust.yml/badge.svg)](https://github.com/alexandre-k/box/actions/workflows/rust.yml)
+
 # `box` — KVM MicroVM Sandboxes with Transparent DNS Telemetry
 
 `box` is a Rust CLI that launches hardware-isolated KVM microVM sandboxes (via Fedora Atomic's `crun-krun`/`libkrun` + `podman`, or Kata Containers + `nerdctl`) with strict filesystem/privilege hardening, composable toolchain presets, and rootless outbound DNS traffic auditing.
