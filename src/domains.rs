@@ -117,6 +117,13 @@ const BUILTIN_ALLOWED_DOMAINS: &[&str] = &[
     "tug.org",
     "docker.io",
     "docker.com",
+    "julialang.org",
+    "k8s.io",
+    "kali.org",
+    "kali.download",
+    "bitcoincore.org",
+    "huggingface.co",
+    "hf.co",
 ];
 
 #[derive(Debug, Clone)]

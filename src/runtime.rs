@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
 use crate::cli::{Cli, NetMode, Preset, VmRuntime};
-use crate::dns::{extract_dns_host_ip, now_epoch};
+use crate::dns::{audit_log_path, extract_dns_host_ip, now_epoch, pcap_archive_dir};
+use crate::domains::default_domains_path;
 use crate::images::{build_combined_image, infer_env_from_image, parse_presets_from_env_label};
 use crate::pcap::{cmd_tracker_path, spawn_pcap_dns_auditor, spawn_pcap_dns_auditor_at};
 
@@ -38,6 +39,8 @@ struct BoxInspect {
     cmd_file: Option<PathBuf>,
     managed: bool,
     is_toolbox: bool,
+    host_port: Option<u16>,
+    llama_bin: Option<PathBuf>,
 }
 
 struct BoxSpec {
@@ -53,6 +56,8 @@ struct BoxSpec {
     venv: Option<String>,
     port: u16,
     expose_port: bool,
+    host_port: Option<u16>,
+    llama_bin: Option<PathBuf>,
     memory: String,
     cpus: u32,
     pids_limit: u32,
@@ -161,6 +166,232 @@ pub fn list_boxes(cli: &Cli) {
             );
         }
         println!();
+    }
+}
+
+pub(crate) fn resolve_container_storage_root(bin: &str, use_sudo: bool) -> Option<String> {
+    if bin == "podman" {
+        let out = container_cmd(bin, use_sudo)
+            .args(["info", "--format", "{{.Store.GraphRoot}}"])
+            .output()
+            .ok()?;
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() && s != "<no value>" {
+                return Some(s);
+            }
+        }
+        return None;
+    }
+    Some("/var/lib/containerd".to_string())
+}
+
+pub(crate) fn resolve_volume_host_path(
+    bin: &str,
+    use_sudo: bool,
+    vol_name: &str,
+) -> Option<String> {
+    let out = container_cmd(bin, use_sudo)
+        .args(["volume", "inspect", "--format", "{{.Mountpoint}}", vol_name])
+        .output()
+        .ok();
+    if let Some(o) = out {
+        if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !s.is_empty() && s != "<no value>" {
+                return Some(s);
+            }
+        }
+    }
+    // Volume may not exist yet; show where Podman will place it on creation.
+    if bin == "podman" {
+        if let Some(root) = resolve_container_storage_root(bin, use_sudo) {
+            return Some(format!("{}/volumes/{}/_data", root, vol_name));
+        }
+    }
+    None
+}
+
+fn dir_contains_shared_libs(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        if s.ends_with(".so") || s.contains(".so.") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolves `--llama-bin <PATH>` into `(host_path_to_mount, guest_mount_target)`.
+/// If `<PATH>` is a directory, mounts it at `/opt/llama`.
+/// If `<PATH>` is a single file whose parent directory holds sibling `.so` libraries
+/// (e.g. `llama.cpp/build/bin/llama-server` alongside `libllama.so`/`libggml*.so`),
+/// mounts that build directory at `/opt/llama` so shared libraries resolve automatically.
+fn resolve_llama_mount(raw: &Path) -> (PathBuf, String) {
+    let canonical = fs::canonicalize(raw).unwrap_or_else(|e| {
+        eprintln!(
+            "Error: Failed to resolve --llama-bin path {:?}: {}",
+            raw, e
+        );
+        process::exit(1);
+    });
+    let forbidden = [
+        PathBuf::from("/"),
+        PathBuf::from("/home"),
+        PathBuf::from("/etc"),
+        PathBuf::from("/var"),
+        PathBuf::from("/usr"),
+    ];
+    if forbidden.contains(&canonical) {
+        eprintln!(
+            "SECURITY ABORT: Refusing to mount system path {:?} via --llama-bin.",
+            canonical
+        );
+        process::exit(1);
+    }
+    if canonical.is_dir() {
+        return (canonical, "/opt/llama".to_string());
+    }
+    if let Some(parent) = canonical.parent() {
+        let home = env::var("HOME").ok().map(PathBuf::from);
+        let safe_parent = !matches!(
+            parent.to_str(),
+            Some("/" | "/usr/bin" | "/usr/local/bin" | "/bin" | "/sbin" | "/usr/sbin")
+        ) && home.as_deref() != Some(parent);
+        if safe_parent && dir_contains_shared_libs(parent) {
+            return (parent.to_path_buf(), "/opt/llama".to_string());
+        }
+    }
+    let file_name = canonical
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("llama-server");
+    (canonical.clone(), format!("/opt/llama/{}", file_name))
+}
+
+pub fn show_storage_paths(cli: &Cli, filter_box: Option<&str>) {
+    let bin = cli.runtime.container_bin();
+    let storage_root = resolve_container_storage_root(bin, cli.sudo)
+        .unwrap_or_else(|| "(unavailable)".to_string());
+    let default_venv_host = resolve_volume_host_path(bin, cli.sudo, &cli.venv)
+        .unwrap_or_else(|| format!("(volume '{}' not created yet)", cli.venv));
+
+    if let Some(target) = filter_box.filter(|s| !s.trim().is_empty()) {
+        let info = inspect_box(bin, cli.sudo, target);
+        println!("================================================================================");
+        println!("  BOX HOST STORAGE & MOUNT PATHS: {}", info.name);
+        println!("================================================================================");
+        println!("  Preset / Image   : {} ({})", info.preset, info.image);
+        println!(
+            "  /workspace       -> {} ({})",
+            info.workspace,
+            if info.rw { "rw" } else { "ro" }
+        );
+        match info.venv.as_deref() {
+            Some(v) => {
+                let host_p = resolve_volume_host_path(bin, cli.sudo, v)
+                    .unwrap_or_else(|| format!("(volume '{}' mountpoint unknown)", v));
+                println!("  /opt/venv        -> {}  [volume: {}]", host_p, v);
+            }
+            None => println!("  /opt/venv        -> (ephemeral / not mounted)"),
+        }
+        if let Some(ref lb) = info.llama_bin {
+            println!("  /opt/llama       -> {} (ro)", lb.display());
+        }
+        if let Some(hp) = info.host_port {
+            println!(
+                "  host.box.internal:{} -> host 127.0.0.1:{}",
+                hp, hp
+            );
+        }
+        println!("  /tmp             -> (ephemeral RAM tmpfs — lost when VM stops)");
+        println!("--------------------------------------------------------------------------------");
+        println!("  Container Store  : {}", storage_root);
+        println!("  Traffic Log      : {}", audit_log_path().display());
+        println!("  PCAP Archive     : {}", pcap_archive_dir().display());
+        println!("  Domain Rules     : {}", default_domains_path().display());
+        if let Some(ref pcap) = info.pcap {
+            println!("  Live Capture     : {}", pcap.display());
+        }
+        return;
+    }
+
+    println!("================================================================================");
+    println!("  BOX HOST STORAGE & MOUNT LOCATIONS");
+    println!("================================================================================");
+    println!("  Default /opt/venv: {}  [volume: {}]", default_venv_host, cli.venv);
+    println!("  Container Store  : {}", storage_root);
+    println!("  Traffic Log      : {}", audit_log_path().display());
+    println!("  PCAP Archive     : {}", pcap_archive_dir().display());
+    println!("  Domain Rules     : {}", default_domains_path().display());
+    println!("  Temp RAM (/tmp)  : ephemeral tmpfs inside VM (not persisted on host)");
+    println!("--------------------------------------------------------------------------------");
+    println!("  SAVED BOX MOUNTS (files saved in /workspace or /opt/venv appear at these host paths)");
+
+    let output = container_cmd(bin, cli.sudo)
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            "label=box.managed=true",
+            "--format",
+            "{{.Names}}\t{{.Label \"box.preset\"}}\t{{.Label \"box.workspace\"}}\t{{.Label \"box.rw\"}}\t{{.Label \"box.venv\"}}\t{{.Label \"box.llama_bin\"}}",
+        ])
+        .output();
+
+    let Ok(out) = output else {
+        println!("  (Unable to query boxes via {})", bin);
+        return;
+    };
+    if !out.status.success() {
+        println!("  (Unable to query boxes via {})", bin);
+        return;
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut count = 0usize;
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        let name = cols.first().copied().unwrap_or("-");
+        let preset = clean_template_val(cols.get(1)).unwrap_or_else(|| "-".to_string());
+        let workspace = clean_template_val(cols.get(2)).unwrap_or_else(|| "-".to_string());
+        let rw = clean_template_val(cols.get(3))
+            .map(|s| s == "true")
+            .unwrap_or(false);
+        let venv = clean_template_val(cols.get(4));
+        let llama_bin = clean_template_val(cols.get(5));
+        count += 1;
+
+        println!("\n  [{}] (preset: {})", name, preset);
+        println!(
+            "    /workspace ({}) -> {}",
+            if rw { "rw" } else { "ro" },
+            workspace
+        );
+        match venv.as_deref() {
+            Some("ephemeral") | None => println!("    /opt/venv       -> (ephemeral)"),
+            Some(v) => {
+                let host_p = resolve_volume_host_path(bin, cli.sudo, v)
+                    .unwrap_or_else(|| format!("(volume '{}')", v));
+                println!("    /opt/venv  (rw) -> {}  [vol: {}]", host_p, v);
+            }
+        }
+        if let Some(lb) = llama_bin {
+            println!("    /opt/llama (ro) -> {}", lb);
+        }
+    }
+
+    if count == 0 {
+        println!("  (No saved boxes found. Launch with `--keep` to save a box, or run `box-where <file>` inside any running VM.)");
+    } else {
+        println!("\n  Tip: Inside any running VM, run `box-where <file>` to print its exact host path.");
     }
 }
 
@@ -316,10 +547,11 @@ fn configure_hardening_and_mounts(
     command: &mut Command,
     spec: &BoxSpec,
     runtime_short: &str,
-) {
+    venv_host_path: Option<&str>,
+) -> Option<PathBuf> {
     command.args(["--name", &spec.box_name]);
 
-    // Metadata labels for `box --list` and `box --attach`
+    // Metadata labels for `box --list`, `box --attach`, and `box --paths`
     let venv_label = spec.venv.as_deref().unwrap_or("ephemeral");
     let userns_label = if spec.runtime == VmRuntime::Krun && !spec.sudo {
         "keep-id"
@@ -344,13 +576,40 @@ fn configure_hardening_and_mounts(
         "--label",
         &format!("box.userns={}", userns_label),
     ]);
+    if let Some(hp) = spec.host_port {
+        command.args(["--label", &format!("box.host_port={}", hp)]);
+    }
 
-    // Common microVM hardening, resource allocation, and Rust/LaTeX-friendly environment
-    let (texmfvar, xdg_cache) = if spec.venv.is_some() {
-        // Persist TeX Live luaotfload font cache & fontconfig cache across runs in /opt/venv
-        ("TEXMFVAR=/opt/venv/texmf-var", "XDG_CACHE_HOME=/opt/venv/cache")
+    let llama_mount: Option<(PathBuf, String)> = spec
+        .llama_bin
+        .as_deref()
+        .map(resolve_llama_mount);
+    if let Some((ref host_src, _)) = llama_mount {
+        command.args(["--label", &format!("box.llama_bin={}", host_src.display())]);
+    }
+
+    // Common microVM hardening, resource allocation, and toolchain-friendly environment
+    let (texmfvar, xdg_cache, julia_depot, bitcoin_datadir, kubeconfig) = if spec.venv.is_some() {
+        (
+            "TEXMFVAR=/opt/venv/texmf-var",
+            "XDG_CACHE_HOME=/opt/venv/cache",
+            "JULIA_DEPOT_PATH=/opt/venv/julia:/usr/local/share/julia",
+            "BITCOIN_DATADIR=/opt/venv/bitcoin",
+            "KUBECONFIG=/opt/venv/kube/config",
+        )
     } else {
-        ("TEXMFVAR=/tmp/texmf-var", "XDG_CACHE_HOME=/tmp/.cache")
+        (
+            "TEXMFVAR=/tmp/texmf-var",
+            "XDG_CACHE_HOME=/tmp/.cache",
+            "JULIA_DEPOT_PATH=/tmp/julia:/usr/local/share/julia",
+            "BITCOIN_DATADIR=/tmp/bitcoin",
+            "KUBECONFIG=/tmp/kubeconfig",
+        )
+    };
+    let path_env = if llama_mount.is_some() {
+        "PATH=/opt/llama:/opt/venv/python/bin:/opt/venv/bin:/opt/venv/cargo/bin:/usr/local/cargo/bin:/usr/local/julia/bin:/tmp/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    } else {
+        "PATH=/opt/venv/python/bin:/opt/venv/bin:/opt/venv/cargo/bin:/usr/local/cargo/bin:/usr/local/julia/bin:/tmp/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     };
     command.args([
         "--read-only",
@@ -365,6 +624,18 @@ fn configure_hardening_and_mounts(
         "-e",
         xdg_cache,
         "-e",
+        julia_depot,
+        "-e",
+        "JULIA_CPU_TARGET=generic",
+        "-e",
+        "JULIA_NUM_PRECOMPILE_TASKS=1",
+        "-e",
+        &format!("PLUTO_PORT={}", spec.port),
+        "-e",
+        bitcoin_datadir,
+        "-e",
+        kubeconfig,
+        "-e",
         "CARGO_HOME=/opt/venv/cargo",
         "-e",
         "CARGO_TARGET_DIR=/tmp/target",
@@ -373,7 +644,9 @@ fn configure_hardening_and_mounts(
         "-e",
         "JUPYTER_RUNTIME_DIR=/tmp/jupyter-runtime",
         "-e",
-        "PATH=/opt/venv/python/bin:/opt/venv/bin:/opt/venv/cargo/bin:/usr/local/cargo/bin:/tmp/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        path_env,
+        "-e",
+        &format!("BOX_HOST_WORKSPACE={}", spec.target_dir.display()),
         "--tmpfs",
         "/tmp:rw,nosuid,size=1g,mode=1777",
         "--pids-limit",
@@ -385,6 +658,17 @@ fn configure_hardening_and_mounts(
         "-w",
         "/workspace",
     ]);
+    if let Some(vhp) = venv_host_path {
+        command.args(["-e", &format!("BOX_HOST_VENV={}", vhp)]);
+    }
+    if let Some((ref host_src, _)) = llama_mount {
+        command.args([
+            "-e",
+            "LD_LIBRARY_PATH=/opt/llama",
+            "-e",
+            &format!("BOX_HOST_LLAMA={}", host_src.display()),
+        ]);
+    }
 
     // Volume mounts (virtio-fs passthrough into the microVM)
     match spec.runtime {
@@ -397,6 +681,9 @@ fn configure_hardening_and_mounts(
             if let Some(ref venv) = spec.venv {
                 command.args(["-v", &format!("{}:/opt/venv:rw,U", venv)]);
             }
+            if let Some((ref host_src, ref guest_dst)) = llama_mount {
+                command.args(["-v", &format!("{}:{}:ro,Z", host_src.display(), guest_dst)]);
+            }
         }
         VmRuntime::Kata => {
             let volume_opts = if spec.rw { "rw" } else { "ro" };
@@ -407,8 +694,26 @@ fn configure_hardening_and_mounts(
             if let Some(ref venv) = spec.venv {
                 command.args(["-v", &format!("{}:/opt/venv:rw", venv)]);
             }
+            if let Some((ref host_src, ref guest_dst)) = llama_mount {
+                command.args(["-v", &format!("{}:{}:ro", host_src.display(), guest_dst)]);
+            }
         }
     }
+
+    llama_mount.map(|(src, _)| src)
+}
+
+fn attach_host_port_env_and_hosts(command: &mut Command, hp: u16) {
+    command.args([
+        "--add-host",
+        "host.box.internal:169.254.2.2",
+        "-e",
+        &format!("BOX_HOST_PORT={}", hp),
+        "-e",
+        &format!("LLAMA_SERVER_URL=http://host.box.internal:{}", hp),
+        "-e",
+        &format!("OPENAI_BASE_URL=http://host.box.internal:{}/v1", hp),
+    ]);
 }
 
 fn cli_or_spec_local_net(
@@ -430,7 +735,7 @@ fn cli_or_spec_local_net(
             } else {
                 // `-o 127.0.0.1` binds pasta's outbound sockets to loopback so all outbound
                 // internet TCP/UDP/DNS is genuinely blocked by the host kernel, while
-                // `-p 127.0.0.1:<port>:<port>` still forwards host browser -> guest (e.g. Jupyter).
+                // `-p 127.0.0.1:<port>:<port>` still forwards host browser -> guest (e.g. Pluto/Jupyter).
                 // `--dns 192.0.2.53` sends DNS attempts onto the tap interface so `--pcap`
                 // captures and logs every blocked request in real time.
                 let pcap_path = spawn_pcap_dns_auditor(
@@ -442,10 +747,16 @@ fn cli_or_spec_local_net(
                     cmd_file,
                     spec.keep,
                 );
+                let host_map_flag = if spec.host_port.is_some() {
+                    ",--map-host-loopback,169.254.2.2"
+                } else {
+                    ""
+                };
                 command.args([
                     "--network",
                     &format!(
-                        "pasta:--no-map-gw,-a,192.0.2.2,-n,24,-g,192.0.2.1,-o,127.0.0.1,--pcap,{}",
+                        "pasta:--no-map-gw{},-a,192.0.2.2,-n,24,-g,192.0.2.1,-o,127.0.0.1,--pcap,{}",
+                        host_map_flag,
                         pcap_path.display()
                     ),
                     "--dns",
@@ -453,10 +764,16 @@ fn cli_or_spec_local_net(
                     "-p",
                     &format!("127.0.0.1:{0}:{0}", spec.port),
                 ]);
-                (
-                    format!("127.0.0.1:{} exposed, outbound blocked & audited", spec.port),
-                    Some(pcap_path),
-                )
+                let note = if let Some(hp) = spec.host_port {
+                    attach_host_port_env_and_hosts(command, hp);
+                    format!(
+                        "127.0.0.1:{} exposed | host 127.0.0.1:{} -> host.box.internal:{} | internet blocked",
+                        spec.port, hp, hp
+                    )
+                } else {
+                    format!("127.0.0.1:{} exposed, outbound blocked & audited", spec.port)
+                };
+                (note, Some(pcap_path))
             }
         }
         VmRuntime::Kata => {
@@ -484,7 +801,7 @@ fn configure_network(
         NetMode::Local => cli_or_spec_local_net(command, spec, cmd_summary, cmd_file),
         NetMode::Internet => match spec.runtime {
             VmRuntime::Krun => {
-                let (note, pcap_opt) = if spec.sudo {
+                let (mut note, pcap_opt) = if spec.sudo {
                     command.args(["--dns", "10.88.0.1"]);
                     ("rootful (dns: 10.88.0.1)".to_string(), None)
                 } else {
@@ -498,14 +815,18 @@ fn configure_network(
                         cmd_file,
                         spec.keep,
                     );
-                    // Keep `--no-map-gw` so the microVM cannot reach host loopback services.
-                    // Podman's default `--dns-forward 169.254.1.1` + `--dns-host <upstream_ip>`
-                    // resolves DNS rootlessly without binding host port 53, while `--pcap`
-                    // captures all tap-facing traffic (even queries bypassing /etc/resolv.conf).
+                    let host_map_flag = if spec.host_port.is_some() {
+                        ",--map-host-loopback,169.254.2.2"
+                    } else {
+                        ""
+                    };
+                    // Keep `--no-map-gw` so the microVM cannot reach host loopback services
+                    // unless `--host-port` explicitly bridges 169.254.2.2 (host.box.internal).
                     command.args([
                         "--network",
                         &format!(
-                            "pasta:--no-map-gw,-M,9a:55:9a:55:9a:55,--dns-host,{},--pcap,{}",
+                            "pasta:--no-map-gw{},-M,9a:55:9a:55:9a:55,--dns-host,{},--pcap,{}",
+                            host_map_flag,
                             upstream_ip,
                             pcap_path.display()
                         ),
@@ -515,6 +836,10 @@ fn configure_network(
                         Some(pcap_path),
                     )
                 };
+                if let Some(hp) = spec.host_port {
+                    attach_host_port_env_and_hosts(command, hp);
+                    note.push_str(&format!(" | host 127.0.0.1:{} -> host.box.internal:{}", hp, hp));
+                }
                 if spec.expose_port {
                     command.args(["-p", &format!("127.0.0.1:{0}:{0}", spec.port)]);
                 }
@@ -541,6 +866,8 @@ struct BoxHeader<'a> {
     workspace: &'a str,
     rw: bool,
     venv: Option<&'a str>,
+    venv_host_path: Option<&'a str>,
+    llama_bin: Option<&'a str>,
     net: NetMode,
     net_detail: &'a str,
     slice: &'a str,
@@ -569,12 +896,26 @@ fn print_box_header(h: &BoxHeader<'_>) {
         NetMode::Local => ansi(color, "36", &format!("local ({})", h.net_detail)),
         NetMode::Internet => ansi(color, "33", &format!("internet ({})", h.net_detail)),
     };
-    let venv_str = match h.venv {
-        Some(v) if h.env_label.contains("python") => {
-            format!("{} -> /opt/venv (python auto-activated)", v)
-        }
-        Some(v) => format!("{} -> /opt/venv", v),
-        None => "ephemeral (none)".to_string(),
+    let venv_hint = if h.env_label.contains("python") {
+        " (python auto-activated)"
+    } else if h.env_label.contains("julia") {
+        " (julia depot)"
+    } else if h.env_label.contains("bitcoin") {
+        " (bitcoin datadir)"
+    } else if h.env_label.contains("k8s") {
+        " (kubeconfig)"
+    } else {
+        ""
+    };
+    let venv_str = match (h.venv, h.venv_host_path) {
+        (Some(v), Some(host_p)) => format!(
+            "/opt/venv  <-  {}  [vol: {}]{}",
+            ansi(color, "36", host_p),
+            v,
+            venv_hint
+        ),
+        (Some(v), None) => format!("/opt/venv  <-  volume '{}'{}", v, venv_hint),
+        (None, _) => "ephemeral (none)".to_string(),
     };
 
     let border = ansi(
@@ -607,11 +948,11 @@ fn print_box_header(h: &BoxHeader<'_>) {
         h.slice
     );
     println!(
-        "{}  {}  {} {} /workspace ({})",
+        "{}  {}  /workspace {} {} ({})",
         bar,
         ansi(color, "2", "Workspace:"),
+        ansi(color, "2", "<-"),
         ansi(color, "36", h.workspace),
-        ansi(color, "2", "->"),
         rw_styled
     );
     if let Some(host_cwd) = h.cwd_mismatch {
@@ -623,13 +964,32 @@ fn print_box_header(h: &BoxHeader<'_>) {
             ansi(color, "2", "(not mounted — pass --mount-cwd to mount it)")
         );
     }
-    println!("{}  {}  {}", bar, ansi(color, "2", "Venv     :"), venv_str);
+    println!("{}  {}  {}", bar, ansi(color, "2", "Venv Data:"), venv_str);
+    if let Some(lb) = h.llama_bin {
+        println!(
+            "{}  {}  /opt/llama {} {} (ro)",
+            bar,
+            ansi(color, "2", "Llama Bin:"),
+            ansi(color, "2", "<-"),
+            ansi(color, "36", lb)
+        );
+    }
+    println!(
+        "{}  {}  {}",
+        bar,
+        ansi(color, "2", "Temp RAM :"),
+        ansi(color, "2", "/tmp <- ephemeral tmpfs (not saved on host)")
+    );
     println!("{}  {}  {}", bar, ansi(color, "2", "Network  :"), net_styled);
     println!(
         "{}  {}  {}",
         bar,
         ansi(color, "2", "Controls :"),
-        ansi(color, "2", "exit = stop VM  |  Ctrl+P Ctrl+Q = detach")
+        ansi(
+            color,
+            "2",
+            "exit = stop VM  |  Ctrl+P Ctrl+Q = detach  |  box-where [file] = host path"
+        )
     );
     println!("{}", border);
 }
@@ -637,7 +997,9 @@ fn print_box_header(h: &BoxHeader<'_>) {
 fn build_container_exec_cmd(spec: &BoxSpec) -> Vec<String> {
     // For interactive bash boxes:
     // 1. Auto-initialize & activate `/opt/venv/python` when running a Python preset.
-    // 2. Report each interactive command to `/run/.box-active-cmd` (when mounted) via
+    // 2. For Bitcoin preset, symlink `~/.bitcoin -> /opt/venv/bitcoin` so bitcoin-cli/bitcoind persist data.
+    // 3. Define `box-where [file]` helper so the user can check the exact host path of any file.
+    // 4. Report each interactive command to `/run/.box-active-cmd` (when mounted) via
     //    bash's DEBUG trap + PROMPT_COMMAND so the host traffic analyzer knows the exact
     //    command (e.g. `curl -iL google.com`, `pip install matplotlib`) that generated traffic.
     let is_interactive_bash = spec.effective_cmd.len() == 1 && spec.effective_cmd[0] == "bash";
@@ -654,6 +1016,13 @@ fi
             );
         }
 
+        if spec.venv.is_some() && spec.env_label.contains("bitcoin") {
+            init_script.push_str(
+                "mkdir -p /opt/venv/bitcoin 2>/dev/null || true\n\
+                 ln -sfn /opt/venv/bitcoin /tmp/.bitcoin 2>/dev/null || true\n",
+            );
+        }
+
         let python_activate = if auto_python {
             "[ -f /opt/venv/python/bin/activate ] && . /opt/venv/python/bin/activate\n"
         } else {
@@ -663,7 +1032,51 @@ fi
         init_script.push_str(&format!(
             r#"cat > /tmp/.box_bashrc <<'BOXRC'
 [ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
-{python_activate}if [ -w /run/.box-active-cmd ]; then
+{python_activate}box-where() {{
+  if [ $# -eq 0 ]; then
+    echo "Guest -> Host storage mappings:"
+    echo "  /workspace -> ${{BOX_HOST_WORKSPACE:-(unmounted)}}"
+    if [ -n "${{BOX_HOST_VENV:-}}" ]; then
+      echo "  /opt/venv  -> $BOX_HOST_VENV"
+    else
+      echo "  /opt/venv  -> (ephemeral / not mounted)"
+    fi
+    if [ -n "${{BOX_HOST_LLAMA:-}}" ]; then
+      echo "  /opt/llama -> $BOX_HOST_LLAMA (ro)"
+    fi
+    echo "  /tmp       -> (ephemeral RAM tmpfs — lost when VM stops)"
+    local cwd_now
+    cwd_now=$(pwd -P 2>/dev/null || pwd)
+    echo ""
+    printf 'Current dir (%s) on host: ' "$cwd_now"
+    box-where "$cwd_now"
+    return 0
+  fi
+  local p="$1"
+  local abs
+  abs=$(realpath -m "$p" 2>/dev/null || readlink -f "$p" 2>/dev/null || printf '%s' "$p")
+  case "$abs" in
+    /workspace) echo "${{BOX_HOST_WORKSPACE:-(unmounted)}}" ;;
+    /workspace/*) printf '%s%s\n' "$BOX_HOST_WORKSPACE" "$(printf '%s' "$abs" | sed 's|^/workspace||')" ;;
+    /opt/venv) echo "${{BOX_HOST_VENV:-(ephemeral)}}" ;;
+    /opt/venv/*)
+      if [ -n "${{BOX_HOST_VENV:-}}" ]; then
+        printf '%s%s\n' "$BOX_HOST_VENV" "$(printf '%s' "$abs" | sed 's|^/opt/venv||')"
+      else
+        echo "(ephemeral — not persisted on host)"
+      fi ;;
+    /opt/llama) echo "${{BOX_HOST_LLAMA:-(not mounted)}}" ;;
+    /opt/llama/*)
+      if [ -n "${{BOX_HOST_LLAMA:-}}" ]; then
+        printf '%s%s\n' "$BOX_HOST_LLAMA" "$(printf '%s' "$abs" | sed 's|^/opt/llama||')"
+      else
+        echo "(not mounted)"
+      fi ;;
+    /tmp|/tmp/*) echo "(ephemeral RAM tmpfs — not saved on host)" ;;
+    *) echo "(inside read-only container image — not a host mount)" ;;
+  esac
+}}
+if [ -w /run/.box-active-cmd ]; then
   __BOX_LAST_CMD="bash"
   __box_preexec() {{
     case "$BASH_COMMAND" in
@@ -693,10 +1106,20 @@ exec bash --rcfile /tmp/.box_bashrc"#,
 fn launch_box(spec: &BoxSpec, launch_mode: &str) -> ! {
     check_kvm_available();
     let cmd_summary = spec.effective_cmd.join(" ");
+    let bin = spec.runtime.container_bin();
+    let venv_host_path = spec
+        .venv
+        .as_deref()
+        .and_then(|v| resolve_volume_host_path(bin, spec.sudo, v));
 
     let (mut command, runtime_short, runtime_label, use_sandbox_slice) =
         build_runtime_command(spec);
-    configure_hardening_and_mounts(&mut command, spec, runtime_short);
+    let llama_host_src = configure_hardening_and_mounts(
+        &mut command,
+        spec,
+        runtime_short,
+        venv_host_path.as_deref(),
+    );
 
     // For rootless krun boxes with traffic auditing (local/internet), bind-mount a single
     // per-box tracker file so the guest shell can report the exact active command.
@@ -742,6 +1165,7 @@ fn launch_box(spec: &BoxSpec, launch_mode: &str) -> ! {
         VmRuntime::Kata => "Kata Containers KVM microVM (io.containerd.kata.v2)".to_string(),
     };
     let workspace_str = spec.target_dir.display().to_string();
+    let llama_host_str = llama_host_src.as_ref().map(|p| p.display().to_string());
 
     print_box_header(&BoxHeader {
         mode: launch_mode,
@@ -752,6 +1176,8 @@ fn launch_box(spec: &BoxSpec, launch_mode: &str) -> ! {
         workspace: &workspace_str,
         rw: spec.rw,
         venv: spec.venv.as_deref(),
+        venv_host_path: venv_host_path.as_deref(),
+        llama_bin: llama_host_str.as_deref(),
         net: spec.net,
         net_detail: &net_detail,
         slice: if use_sandbox_slice {
@@ -768,6 +1194,14 @@ fn launch_box(spec: &BoxSpec, launch_mode: &str) -> ! {
 }
 
 pub fn run_box(cli: &Cli) {
+    if cli.host_port.is_some() && cli.net == Some(NetMode::None) {
+        eprintln!(
+            "ERROR: `--host-port` cannot be used with `--net none` (air-gapped without loopback bridge).\n\
+             Omit `--net` (defaults to `--net local` when `--host-port` is set) or pass `--net local` / `--net internet`."
+        );
+        process::exit(1);
+    }
+
     let raw_dir = cli.dir.clone().unwrap_or_else(|| {
         env::current_dir().expect("Failed to determine current working directory")
     });
@@ -794,6 +1228,14 @@ pub fn run_box(cli: &Cli) {
         cli.cmd.clone()
     };
 
+    let effective_net = cli.net.unwrap_or_else(|| {
+        if cli.host_port.is_some() {
+            NetMode::Local
+        } else {
+            NetMode::None
+        }
+    });
+
     let spec = BoxSpec {
         box_name,
         image,
@@ -801,7 +1243,7 @@ pub fn run_box(cli: &Cli) {
         target_dir,
         effective_cmd,
         runtime: cli.runtime,
-        net: cli.net.unwrap_or(NetMode::None),
+        net: effective_net,
         rw: cli.rw,
         keep: cli.keep,
         venv: if cli.ephemeral {
@@ -811,6 +1253,8 @@ pub fn run_box(cli: &Cli) {
         },
         port: cli.port,
         expose_port: cli.expose_port,
+        host_port: cli.host_port,
+        llama_bin: cli.llama_bin.clone(),
         memory: cli.memory.clone(),
         cpus: cli.cpus,
         pids_limit: cli.pids_limit,
@@ -845,6 +1289,41 @@ pub(crate) fn infer_net_mode(network_mode: &str) -> NetMode {
     }
 }
 
+pub(crate) fn parse_cmd_field(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "null" || trimmed == "<no value>" {
+        return Vec::new();
+    }
+    if !trimmed.starts_with('[') {
+        return trimmed.split_whitespace().map(String::from).collect();
+    }
+    let mut out = Vec::new();
+    let mut chars = trimmed.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            let mut s = String::new();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '"' => break,
+                    '\\' => match chars.next() {
+                        Some('n') => s.push('\n'),
+                        Some('r') => s.push('\r'),
+                        Some('t') => s.push('\t'),
+                        Some('"') => s.push('"'),
+                        Some('\\') => s.push('\\'),
+                        Some('/') => s.push('/'),
+                        Some(other) => s.push(other),
+                        None => break,
+                    },
+                    other => s.push(other),
+                }
+            }
+            out.push(s);
+        }
+    }
+    out
+}
+
 fn parse_inspect_output(raw: &str) -> Option<BoxInspect> {
     let line = raw.lines().find(|l| !l.trim().is_empty())?;
     let cols: Vec<&str> = line.split('\t').collect();
@@ -871,19 +1350,21 @@ fn parse_inspect_output(raw: &str) -> Option<BoxInspect> {
     let pcap = clean_template_val(cols.get(10))
         .map(PathBuf::from)
         .or_else(|| extract_pcap_from_netmode(&network_mode));
-    let cmd = clean_template_val(cols.get(11))
-        .map(|s| s.split_whitespace().map(String::from).collect())
-        .unwrap_or_default();
-    let keep_id = clean_template_val(cols.get(12))
+    let keep_id = clean_template_val(cols.get(11))
         .map(|s| s == "keep-id")
         .unwrap_or(false);
-    let cmd_file = clean_template_val(cols.get(13)).map(PathBuf::from);
-    let managed = clean_template_val(cols.get(14))
+    let cmd_file = clean_template_val(cols.get(12)).map(PathBuf::from);
+    let managed = clean_template_val(cols.get(13))
         .map(|s| s == "true")
         .unwrap_or(false);
-    let is_toolbox = clean_template_val(cols.get(15))
+    let is_toolbox = clean_template_val(cols.get(14))
         .map(|s| s == "true")
         .unwrap_or(false);
+    let host_port = clean_template_val(cols.get(15)).and_then(|s| s.parse::<u16>().ok());
+    let llama_bin = clean_template_val(cols.get(16)).map(PathBuf::from);
+    let cmd = clean_template_val(cols.get(17))
+        .map(|s| parse_cmd_field(&s))
+        .unwrap_or_default();
 
     Some(BoxInspect {
         running,
@@ -902,11 +1383,13 @@ fn parse_inspect_output(raw: &str) -> Option<BoxInspect> {
         cmd_file,
         managed,
         is_toolbox,
+        host_port,
+        llama_bin,
     })
 }
 
-fn inspect_box(bin: &str, use_sudo: bool, target: &str) -> BoxInspect {
-    let fmt = "{{.State.Running}}\t{{.Name}}\t{{.Config.Image}}\t{{.HostConfig.NetworkMode}}\t{{index .Config.Labels \"box.preset\"}}\t{{index .Config.Labels \"box.workspace\"}}\t{{index .Config.Labels \"box.runtime\"}}\t{{index .Config.Labels \"box.net\"}}\t{{index .Config.Labels \"box.rw\"}}\t{{index .Config.Labels \"box.venv\"}}\t{{index .Config.Labels \"box.pcap\"}}\t{{range .Config.Cmd}}{{.}} {{end}}\t{{index .Config.Labels \"box.userns\"}}\t{{index .Config.Labels \"box.cmdfile\"}}\t{{index .Config.Labels \"box.managed\"}}\t{{index .Config.Labels \"com.github.containers.toolbox\"}}";
+fn try_inspect_box(bin: &str, use_sudo: bool, target: &str) -> Option<BoxInspect> {
+    let fmt = "{{.State.Running}}\t{{.Name}}\t{{.Config.Image}}\t{{.HostConfig.NetworkMode}}\t{{index .Config.Labels \"box.preset\"}}\t{{index .Config.Labels \"box.workspace\"}}\t{{index .Config.Labels \"box.runtime\"}}\t{{index .Config.Labels \"box.net\"}}\t{{index .Config.Labels \"box.rw\"}}\t{{index .Config.Labels \"box.venv\"}}\t{{index .Config.Labels \"box.pcap\"}}\t{{index .Config.Labels \"box.userns\"}}\t{{index .Config.Labels \"box.cmdfile\"}}\t{{index .Config.Labels \"box.managed\"}}\t{{index .Config.Labels \"com.github.containers.toolbox\"}}\t{{index .Config.Labels \"box.host_port\"}}\t{{index .Config.Labels \"box.llama_bin\"}}\t{{json .Config.Cmd}}";
     let output = container_cmd(bin, use_sudo)
         .args(["container", "inspect", "--format", fmt, target])
         .output()
@@ -923,21 +1406,36 @@ fn inspect_box(bin: &str, use_sudo: bool, target: &str) -> BoxInspect {
         });
 
     if !output.status.success() {
-        eprintln!(
-            "ERROR: Could not find box '{}' (runtime: {}): {}",
-            target,
-            bin,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        eprintln!("Run `box --list` to see available boxes.");
-        process::exit(1);
+        return None;
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_inspect_output(&stdout).unwrap_or_else(|| {
-        eprintln!("ERROR: Failed to parse inspect metadata for '{}'.", target);
+    parse_inspect_output(&stdout)
+}
+
+fn inspect_box(bin: &str, use_sudo: bool, target: &str) -> BoxInspect {
+    try_inspect_box(bin, use_sudo, target).unwrap_or_else(|| {
+        eprintln!(
+            "ERROR: Could not find box '{}' (runtime: {}).",
+            target, bin
+        );
+        eprintln!("Run `box --list` to see available boxes.");
         process::exit(1);
     })
+}
+
+pub(crate) fn is_interactive_shell_cmd(cmd: &[String]) -> bool {
+    if cmd.iter().any(|tok| tok.contains("/tmp/.box_bashrc")) {
+        return true;
+    }
+    if cmd.len() == 1 {
+        let base = Path::new(&cmd[0])
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        return matches!(base, "bash" | "sh" | "ash" | "dash" | "zsh" | "fish");
+    }
+    false
 }
 
 fn pick_free_local_port(preferred: u16) -> u16 {
@@ -953,8 +1451,86 @@ pub fn attach_box(cli: &Cli, target: &str) {
     if cli.runtime == VmRuntime::Kata {
         check_kata_installed();
     }
+    if cli.host_port.is_some() && cli.net == Some(NetMode::None) {
+        eprintln!(
+            "ERROR: `--host-port` cannot be used with `--net none`.\n\
+             Omit `--net` (defaults to `--net local`) or pass `--net local` / `--net internet`."
+        );
+        process::exit(1);
+    }
+
     let bin = cli.runtime.container_bin();
-    let info = inspect_box(bin, cli.sudo, target);
+    let Some(info) = try_inspect_box(bin, cli.sudo, target) else {
+        // Box does not exist yet: auto-create it if `target` matches a preset name
+        // (e.g. `box --attach rust --rw`, `box --attach julia --net local`) or if
+        // `--preset` / `--image` was explicitly provided.
+        let inferred_presets = if !cli.preset.is_empty() {
+            cli.preset.clone()
+        } else {
+            parse_presets_from_env_label(target)
+        };
+
+        if cli.image.is_none() && inferred_presets.is_empty() {
+            eprintln!("ERROR: Could not find box '{}' (runtime: {}).", target, bin);
+            eprintln!(
+                "Run `box --list` to see available boxes, or auto-create it with:\n  box --attach {} --preset <rust|python|julia|bitcoin|k8s|llama|kali|latex|node|alpine>",
+                target
+            );
+            process::exit(1);
+        }
+
+        let raw_dir = cli.dir.clone().unwrap_or_else(|| {
+            env::current_dir().expect("Failed to determine current working directory")
+        });
+        let target_dir = validate_target_dir(&raw_dir);
+        let (image, env_label) = if let Some(ref custom_img) = cli.image {
+            (custom_img.clone(), infer_env_from_image(custom_img))
+        } else {
+            build_combined_image(cli, &inferred_presets)
+        };
+        let effective_cmd = if !cli.cmd.is_empty() {
+            cli.cmd.clone()
+        } else if env_label == "alpine" {
+            vec!["sh".to_string()]
+        } else {
+            vec!["bash".to_string()]
+        };
+        let effective_net = cli.net.unwrap_or_else(|| {
+            if cli.host_port.is_some() {
+                NetMode::Local
+            } else {
+                NetMode::None
+            }
+        });
+        let spec = BoxSpec {
+            box_name: target.to_string(),
+            image,
+            env_label,
+            target_dir,
+            effective_cmd,
+            runtime: cli.runtime,
+            net: effective_net,
+            rw: cli.rw,
+            // Persist the auto-created box when entering an interactive shell (or if --keep is set)
+            keep: cli.cmd.is_empty() || cli.keep,
+            venv: if cli.ephemeral {
+                None
+            } else {
+                Some(cli.venv.clone())
+            },
+            port: cli.port,
+            expose_port: cli.expose_port,
+            host_port: cli.host_port,
+            llama_bin: cli.llama_bin.clone(),
+            memory: cli.memory.clone(),
+            cpus: cli.cpus,
+            pids_limit: cli.pids_limit,
+            sudo: cli.sudo,
+            upstream_dns: cli.upstream_dns.clone(),
+        };
+        launch_box(&spec, "CREATED & LAUNCHING");
+    };
+
     if !info.managed {
         let kind = if info.is_toolbox {
             "a Fedora Toolbox container"
@@ -975,7 +1551,15 @@ pub fn attach_box(cli: &Cli, target: &str) {
     let saved_net = info
         .net
         .unwrap_or_else(|| infer_net_mode(&info.network_mode));
-    let effective_net = cli.net.unwrap_or(saved_net);
+    let effective_host_port = cli.host_port.or(info.host_port);
+    let effective_llama_bin = cli.llama_bin.clone().or_else(|| info.llama_bin.clone());
+    let effective_net = cli.net.unwrap_or_else(|| {
+        if effective_host_port.is_some() && saved_net == NetMode::None {
+            NetMode::Local
+        } else {
+            saved_net
+        }
+    });
 
     let requested_dir: Option<PathBuf> = if let Some(ref dir) = cli.dir {
         Some(dir.clone())
@@ -1000,10 +1584,6 @@ pub fn attach_box(cli: &Cli, target: &str) {
     let resolve_attach_cmd = |env_label: &str| -> Vec<String> {
         if !cli.cmd.is_empty() {
             cli.cmd.clone()
-        } else if !info.cmd.is_empty()
-            && !info.cmd.iter().any(|tok| tok.contains("/tmp/.box_bashrc"))
-        {
-            info.cmd.clone()
         } else if env_label == "alpine" {
             vec!["sh".to_string()]
         } else {
@@ -1012,10 +1592,11 @@ pub fn attach_box(cli: &Cli, target: &str) {
     };
 
     // Spawn a fresh sibling microVM (inheriting the existing box's image, preset, mounts,
-    // /opt/venv, and network — without killing or hijacking the running process) whenever:
-    //   1. The target box is already running (unless `--same-tty` is explicitly passed), OR
-    //   2. `--new` is explicitly passed.
-    if (info.running && !cli.same_tty) || cli.new_vm {
+    // /opt/venv, and network — without killing or overwriting the saved box) whenever:
+    //   1. An explicit command was passed (`!cli.cmd.is_empty()`, e.g. `box --attach rust ping google.com`), OR
+    //   2. The target box is already running (unless `--same-tty` is explicitly passed), OR
+    //   3. `--new` is explicitly passed.
+    if !cli.cmd.is_empty() || (info.running && !cli.same_tty) || cli.new_vm {
         let target_dir = resolve_attach_dir(&requested_dir);
         let (image, env_label) = if cli.rebuild {
             let presets = parse_presets_from_env_label(&info.preset);
@@ -1053,6 +1634,8 @@ pub fn attach_box(cli: &Cli, target: &str) {
             venv: if cli.ephemeral { None } else { info.venv },
             port: sibling_port,
             expose_port: cli.expose_port,
+            host_port: effective_host_port,
+            llama_bin: effective_llama_bin,
             memory: cli.memory.clone(),
             cpus: cli.cpus,
             pids_limit: cli.pids_limit,
@@ -1063,6 +1646,9 @@ pub fn attach_box(cli: &Cli, target: &str) {
     }
 
     let needs_net_change = effective_net != saved_net;
+    let needs_host_port_change = cli.host_port.is_some() && cli.host_port != info.host_port;
+    let needs_llama_bin_change = cli.llama_bin.is_some() && cli.llama_bin != info.llama_bin;
+    let needs_shell_upgrade = !is_interactive_shell_cmd(&info.cmd);
     let needs_local_audit_upgrade = runtime == VmRuntime::Krun
         && !cli.sudo
         && effective_net == NetMode::Local
@@ -1087,6 +1673,9 @@ pub fn attach_box(cli: &Cli, target: &str) {
     let wants_recreate = !info.running
         && (cli.rebuild
             || needs_net_change
+            || needs_host_port_change
+            || needs_llama_bin_change
+            || needs_shell_upgrade
             || needs_local_audit_upgrade
             || needs_cmd_tracker_upgrade
             || needs_rw_upgrade
@@ -1147,6 +1736,8 @@ pub fn attach_box(cli: &Cli, target: &str) {
             venv: if cli.ephemeral { None } else { info.venv },
             port: cli.port,
             expose_port: cli.expose_port,
+            host_port: effective_host_port,
+            llama_bin: effective_llama_bin,
             memory: cli.memory.clone(),
             cpus: cli.cpus,
             pids_limit: cli.pids_limit,
@@ -1166,6 +1757,11 @@ pub fn attach_box(cli: &Cli, target: &str) {
         VmRuntime::Krun => "libkrun KVM microVM (/usr/bin/krun)",
         VmRuntime::Kata => "Kata Containers KVM microVM (io.containerd.kata.v2)",
     };
+    let venv_host_path = info
+        .venv
+        .as_deref()
+        .and_then(|v| resolve_volume_host_path(bin, cli.sudo, v));
+    let llama_bin_str = info.llama_bin.as_ref().map(|p| p.display().to_string());
 
     if info.running {
         let net_detail = match effective_net {
@@ -1188,6 +1784,8 @@ pub fn attach_box(cli: &Cli, target: &str) {
             workspace: &info.workspace,
             rw: info.rw,
             venv: info.venv.as_deref(),
+            venv_host_path: venv_host_path.as_deref(),
+            llama_bin: llama_bin_str.as_deref(),
             net: effective_net,
             net_detail: &net_detail,
             slice: "active",
@@ -1249,6 +1847,8 @@ pub fn attach_box(cli: &Cli, target: &str) {
         workspace: &info.workspace,
         rw: info.rw,
         venv: info.venv.as_deref(),
+        venv_host_path: venv_host_path.as_deref(),
+        llama_bin: llama_bin_str.as_deref(),
         net: effective_net,
         net_detail,
         slice: if use_slice {
@@ -1525,7 +2125,7 @@ mod tests {
 
     #[test]
     fn parses_container_inspect_output() {
-        let raw = "true\t/my-rust\tdocker.io/library/rust:slim\tpasta:--no-map-gw,--pcap,/run/user/1000/a.pcap\trust\t/var/home/alex/proj\tkrun\tinternet\ttrue\tbox-venv\t/run/user/1000/a.pcap\tbash \n";
+        let raw = "true\t/my-rust\tdocker.io/library/rust:slim\tpasta:--no-map-gw,--pcap,/run/user/1000/a.pcap\trust\t/var/home/alex/proj\tkrun\tinternet\ttrue\tbox-venv\t/run/user/1000/a.pcap\tkeep-id\t/run/user/1000/cmd\ttrue\t<no value>\t8080\t/opt/my-llama\t[\"bash\",\"-c\",\"cat > /tmp/.box_bashrc <<'BOXRC'\\nexec bash --rcfile /tmp/.box_bashrc\"]\n";
         let info = parse_inspect_output(raw).unwrap();
         assert!(info.running);
         assert_eq!(info.name, "my-rust");
@@ -1536,6 +2136,31 @@ mod tests {
         assert!(info.rw);
         assert_eq!(info.venv.as_deref(), Some("box-venv"));
         assert_eq!(info.pcap, Some(PathBuf::from("/run/user/1000/a.pcap")));
-        assert_eq!(info.cmd, vec!["bash"]);
+        assert!(info.keep_id);
+        assert!(info.managed);
+        assert!(!info.is_toolbox);
+        assert_eq!(info.host_port, Some(8080));
+        assert_eq!(info.llama_bin, Some(PathBuf::from("/opt/my-llama")));
+        assert!(is_interactive_shell_cmd(&info.cmd));
+    }
+
+    #[test]
+    fn detects_interactive_shell_commands() {
+        assert!(is_interactive_shell_cmd(&["bash".to_string()]));
+        assert!(is_interactive_shell_cmd(&["/bin/sh".to_string()]));
+        assert!(is_interactive_shell_cmd(&[
+            "bash".to_string(),
+            "-c".to_string(),
+            "exec bash --rcfile /tmp/.box_bashrc".to_string()
+        ]));
+        assert!(!is_interactive_shell_cmd(&[
+            "cargo".to_string(),
+            "run".to_string()
+        ]));
+        assert!(!is_interactive_shell_cmd(&[
+            "ping".to_string(),
+            "google.com".to_string()
+        ]));
+        assert!(!is_interactive_shell_cmd(&[]));
     }
 }

@@ -118,14 +118,22 @@ Events are appended as JSON Lines to `${XDG_DATA_HOME:-$HOME/.local/share}/box/d
 {"ts":1795142870,"box":"box-rust-42870","env":"rust","workspace":"/var/home/alex/Documents/kata-sandbox","cmd":"getent ahosts crates.io","domain":"crates.io","qtype":"A","ips":["151.101.66.137","151.101.2.137"],"dns_server":"169.254.1.1"}
 ```
 
-### 4. Composable Toolchain Presets
+### 4. Composable Toolchain Presets & Host Storage Paths
 
-Pass one or more `--preset` values (`alpine`, `latex`, `node`, `python`, `rust`):
+Pass one or more `--preset` values (`alpine`, `bitcoin`, `julia`, `k8s`, `kali`, `latex`, `llama`, `node`, `python`, `rust`):
 
-- **Every preset** (`alpine`, `latex`, `node`, `python`, `rust` — single or combined) builds a locally cached `localhost/box-env:<sorted-presets>` image that includes `ca-certificates`, `curl`, `ping` (`iputils-ping` / `iputils`), and `vim` out of the box (plus `fontconfig`, `fonts-liberation`, `fonts-dejavu-core`, and a prebuilt `luaotfload` font database whenever `latex` is included).
-- **Multiple presets** (e.g. `--preset latex,python`) automatically select the heaviest preset as the `FROM` base (`latex > rust > node > python > alpine`) and install the remaining toolchains (use `--rebuild` to force a rebuild, including with `--attach <box> --rebuild`).
-- At runtime, `TEXMFVAR=/opt/venv/texmf-var` and `XDG_CACHE_HOME=/opt/venv/cache` keep TeX Live / `luaotfload` / `fontconfig` caches persistent across restarts when `/opt/venv` is mounted.
-- `alpine` (musl/apk) cannot be combined with Debian-based presets.
+- **Every preset** builds a locally cached `localhost/box-env:<sorted-presets>` image that includes `ca-certificates`, `curl`, `ping` (`iputils-ping` / `iputils`), and `vim` out of the box:
+  - **`julia`**: Official `julia:latest` with **Pluto.jl** pre-installed in `/usr/local/share/julia`, a `pluto` launcher command (binds `0.0.0.0:$PLUTO_PORT`, default `8888`, for `--net local`), and persistent `JULIA_DEPOT_PATH=/opt/venv/julia:/usr/local/share/julia`.
+  - **`bitcoin`**: Official Bitcoin Core release binaries (`bitcoin-cli`, `bitcoind`, `bitcoin-tx`, `bitcoin-util`, `bitcoin-wallet`) with persistent `BITCOIN_DATADIR=/opt/venv/bitcoin` (`~/.bitcoin` symlinked automatically).
+  - **`k8s`**: Official `kubectl` + `jq` with persistent `KUBECONFIG=/opt/venv/kube/config`.
+  - **`llama`**: Fedora base (`docker.io/library/fedora:latest`) matching host Fedora glibc/libstdc++ (`libgomp`, `libcurl`, `python3`, `jq`) — supports **both** running your host-compiled `llama-server` inside the VM (`--llama-bin /path/to/llama.cpp/build/bin`, mounted read-only at `/opt/llama` with `PATH` and `LD_LIBRARY_PATH` configured) **and** talking to a host-running `llama-server` (`--host-port 8080`, reachable inside the VM at `http://host.box.internal:8080` / `$LLAMA_SERVER_URL` / `$OPENAI_BASE_URL`, even while air-gapped from the internet).
+  - **`kali`**: `kalilinux/kali-rolling` with lightweight recon/network essentials (`nmap`, `dnsutils`, `netcat-openbsd`, `whois`, `traceroute`, `jq`, `git`) and full Kali `apt` repos.
+  - **`latex`**, **`python`**, **`rust`**, **`node`**, **`alpine`**: Existing presets with persistent `/opt/venv` caches (Python venv auto-activated; `luaotfload` & Liberation/DejaVu fonts prebuilt for LaTeX).
+- **Multiple Debian presets** (e.g. `--preset latex,python`, `--preset k8s,python`, `--preset kali,k8s`) combine automatically (`kali > julia > latex > rust > node > python/bitcoin/k8s`). `alpine` (musl/apk) and `llama` (Fedora/dnf) cannot be combined with Debian presets.
+- **Host storage visibility:**
+  - Every launch/attach header prints the exact host paths for `/workspace`, `/opt/venv` (resolved Podman volume mountpoint), `/opt/llama` (if set), and `/tmp` (ephemeral RAM).
+  - From the host, run `box --paths` (alias `box --where`) or `box --paths <BOX>` / `box --inspect <BOX>` to inspect where all workspaces, `/opt/venv` data, container images, traffic logs, and PCAPs live on disk.
+  - Inside any running VM, run `box-where` or `box-where <file>` to print the exact host filesystem path of a saved file.
 
 ### 5. Traffic Dashboard, Real-Time Monitoring & Domain Comparison
 

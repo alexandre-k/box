@@ -3,8 +3,13 @@ use std::path::PathBuf;
 use std::process;
 
 use crate::cli::{Cli, NetMode, VmRuntime};
+use crate::dns::{audit_log_path, pcap_archive_dir};
+use crate::domains::default_domains_path;
 use crate::images::infer_env_from_image;
-use crate::runtime::{clean_template_val, container_cmd, extract_pcap_from_netmode, infer_net_mode};
+use crate::runtime::{
+    clean_template_val, container_cmd, extract_pcap_from_netmode, infer_net_mode, parse_cmd_field,
+    resolve_container_storage_root, resolve_volume_host_path,
+};
 
 #[derive(Debug)]
 struct ContainerStackInfo {
@@ -28,6 +33,8 @@ struct ContainerStackInfo {
     venv: Option<String>,
     pcap: Option<PathBuf>,
     cmd: String,
+    host_port: Option<u16>,
+    llama_bin: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -90,7 +97,7 @@ fn query_container_info(cli: &Cli, target: &str) -> ContainerStackInfo {
         VmRuntime::Kata => "{{.HostConfig.Runtime}}",
     };
     let fmt = format!(
-        "{{{{.Id}}}}\t{{{{.Name}}}}\t{{{{.State.Status}}}}\t{}\t{{{{.Config.Image}}}}\t{{{{.HostConfig.ReadonlyRootfs}}}}\t{{{{.Config.User}}}}\t{{{{.HostConfig.UsernsMode}}}}\t{{{{.HostConfig.Memory}}}}\t{{{{.HostConfig.PidsLimit}}}}\t{{{{.HostConfig.CapDrop}}}}\t{{{{.HostConfig.NetworkMode}}}}\t{{{{index .Config.Labels \"box.managed\"}}}}\t{{{{index .Config.Labels \"box.preset\"}}}}\t{{{{index .Config.Labels \"box.workspace\"}}}}\t{{{{index .Config.Labels \"box.net\"}}}}\t{{{{index .Config.Labels \"box.rw\"}}}}\t{{{{index .Config.Labels \"box.venv\"}}}}\t{{{{index .Config.Labels \"box.pcap\"}}}}\t{{{{range .Config.Cmd}}}}{{{{.}}}} {{{{end}}}}",
+        "{{{{.Id}}}}\t{{{{.Name}}}}\t{{{{.State.Status}}}}\t{}\t{{{{.Config.Image}}}}\t{{{{.HostConfig.ReadonlyRootfs}}}}\t{{{{.Config.User}}}}\t{{{{.HostConfig.UsernsMode}}}}\t{{{{.HostConfig.Memory}}}}\t{{{{.HostConfig.PidsLimit}}}}\t{{{{.HostConfig.CapDrop}}}}\t{{{{.HostConfig.NetworkMode}}}}\t{{{{index .Config.Labels \"box.managed\"}}}}\t{{{{index .Config.Labels \"box.preset\"}}}}\t{{{{index .Config.Labels \"box.workspace\"}}}}\t{{{{index .Config.Labels \"box.net\"}}}}\t{{{{index .Config.Labels \"box.rw\"}}}}\t{{{{index .Config.Labels \"box.venv\"}}}}\t{{{{index .Config.Labels \"box.pcap\"}}}}\t{{{{index .Config.Labels \"box.host_port\"}}}}\t{{{{index .Config.Labels \"box.llama_bin\"}}}}\t{{{{json .Config.Cmd}}}}",
         runtime_field
     );
 
@@ -153,7 +160,18 @@ fn query_container_info(cli: &Cli, target: &str) -> ContainerStackInfo {
     let pcap = clean_template_val(cols.get(18))
         .map(PathBuf::from)
         .or_else(|| extract_pcap_from_netmode(&network_mode));
-    let cmd = clean_template_val(cols.get(19)).unwrap_or_else(|| "-".to_string());
+    let host_port = clean_template_val(cols.get(19)).and_then(|s| s.parse::<u16>().ok());
+    let llama_bin = clean_template_val(cols.get(20));
+    let cmd_tokens = clean_template_val(cols.get(21))
+        .map(|s| parse_cmd_field(&s))
+        .unwrap_or_default();
+    let cmd = if cmd_tokens.iter().any(|t| t.contains("/tmp/.box_bashrc")) {
+        "bash (interactive)".to_string()
+    } else if cmd_tokens.is_empty() {
+        "-".to_string()
+    } else {
+        cmd_tokens.join(" ")
+    };
 
     ContainerStackInfo {
         id,
@@ -176,6 +194,8 @@ fn query_container_info(cli: &Cli, target: &str) -> ContainerStackInfo {
         venv,
         pcap,
         cmd,
+        host_port,
+        llama_bin,
     }
 }
 
@@ -295,19 +315,22 @@ fi
     };
 
     let script = format!(
-        r#"export PATH="/opt/venv/python/bin:/opt/venv/bin:/opt/venv/cargo/bin:/usr/local/cargo/bin:$PATH"
+        r#"export PATH="/opt/llama:/opt/venv/python/bin:/opt/venv/bin:/opt/venv/cargo/bin:/usr/local/cargo/bin:/usr/local/julia/bin:$PATH"
 OS_NAME=$(grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2-)
 echo "OS=${{OS_NAME:-unknown}}"
 echo "KERNEL=$(cat /proc/sys/kernel/osrelease 2>/dev/null)"
 echo "VERSION=$(cat /proc/version 2>/dev/null)"
 echo "HYPERVISOR=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | grep -o hypervisor || echo none)"
 echo "ROOTFS=$(awk '$2=="/"{{print $3; exit}}' /proc/mounts 2>/dev/null)"
-for t in rustc cargo python3 pip3 node npm pdflatex xelatex lualatex latexmk gcc g++ clang make cmake go java ruby git curl wget sqlite3 bash sh; do
+for t in rustc cargo python3 pip3 julia pluto bitcoin-cli bitcoind kubectl llama-server nmap node npm pdflatex xelatex lualatex latexmk gcc g++ clang make cmake go java ruby git curl wget vim ping sqlite3 bash sh; do
   if command -v "$t" >/dev/null 2>&1; then
     case "$t" in
       sh) V="POSIX sh ($(readlink -f "$(command -v sh)" 2>/dev/null || command -v sh))" ;;
       java) V=$(java -version 2>&1 | head -n1) ;;
       go) V=$(go version 2>&1 | head -n1) ;;
+      kubectl) V=$(kubectl version --client 2>&1 | head -n1) ;;
+      pluto) V="Pluto.jl notebook launcher (/usr/local/bin/pluto)" ;;
+      ping) V=$(ping -V 2>&1 | head -n1) ;;
       *) V=$("$t" --version 2>&1 | head -n1) ;;
     esac
     echo "TOOL=$t|$V"
@@ -397,14 +420,41 @@ pub fn inspect_box_stack(cli: &Cli, target: &str) {
             info.pids_limit.to_string()
         }
     );
+    let bin = cli.runtime.container_bin();
+    let venv_host_path = info
+        .venv
+        .as_deref()
+        .and_then(|v| resolve_volume_host_path(bin, cli.sudo, v));
+    let storage_root = resolve_container_storage_root(bin, cli.sudo);
+
     println!(
-        "  Workspace Mount  : {} ({})",
+        "  Workspace Mount  : /workspace <- {} ({})",
         info.workspace,
         if info.rw { "rw" } else { "ro" }
     );
+    match (info.venv.as_deref(), venv_host_path.as_deref()) {
+        (Some(v), Some(hp)) => println!("  Persistent Venv  : /opt/venv  <- {} [vol: {}]", hp, v),
+        (Some(v), None) => println!("  Persistent Venv  : /opt/venv  <- volume '{}'", v),
+        (None, _) => println!("  Persistent Venv  : ephemeral (none)"),
+    }
+    if let Some(ref lb) = info.llama_bin {
+        println!("  Llama Binary     : /opt/llama <- {} (ro)", lb);
+    }
+    if let Some(hp) = info.host_port {
+        println!(
+            "  Host Port Bridge : host.box.internal:{} -> host 127.0.0.1:{}",
+            hp, hp
+        );
+    }
+    println!("  Temp RAM (/tmp)  : ephemeral tmpfs (not persisted on host)");
+    if let Some(ref root) = storage_root {
+        println!("  Container Store  : {}", root);
+    }
     println!(
-        "  Persistent Venv  : {}",
-        info.venv.as_deref().unwrap_or("ephemeral (none)")
+        "  Box Data / Logs  : {} | pcaps: {} | rules: {}",
+        audit_log_path().display(),
+        pcap_archive_dir().display(),
+        default_domains_path().display()
     );
     println!(
         "  Network          : {} ({})",

@@ -6,7 +6,25 @@ use crate::runtime::container_cmd;
 
 pub fn infer_env_from_image(image: &str) -> String {
     let lower = image.to_lowercase();
-    if lower.contains("rust") {
+    if lower.contains("box-env:") {
+        if let Some(tag) = lower.split("box-env:").nth(1) {
+            let label = tag.replace('-', "+");
+            if !label.is_empty() {
+                return label;
+            }
+        }
+    }
+    if lower.contains("kali") {
+        "kali".to_string()
+    } else if lower.contains("julia") {
+        "julia".to_string()
+    } else if lower.contains("bitcoin") {
+        "bitcoin".to_string()
+    } else if lower.contains("k8s") || lower.contains("kubectl") {
+        "k8s".to_string()
+    } else if lower.contains("llama") {
+        "llama".to_string()
+    } else if lower.contains("rust") {
         "rust".to_string()
     } else if lower.contains("python") {
         "python".to_string()
@@ -26,7 +44,12 @@ pub fn parse_presets_from_env_label(env_label: &str) -> Vec<Preset> {
         .split('+')
         .filter_map(|part| match part.trim().to_lowercase().as_str() {
             "alpine" => Some(Preset::Alpine),
+            "bitcoin" => Some(Preset::Bitcoin),
+            "julia" => Some(Preset::Julia),
+            "k8s" => Some(Preset::K8s),
+            "kali" => Some(Preset::Kali),
             "latex" => Some(Preset::Latex),
+            "llama" => Some(Preset::Llama),
             "node" => Some(Preset::Node),
             "python" => Some(Preset::Python),
             "rust" => Some(Preset::Rust),
@@ -51,6 +74,16 @@ fn generate_containerfile(base_preset: Preset, presets: &[Preset]) -> String {
         );
     }
 
+    if base_preset == Preset::Llama {
+        return format!(
+            "FROM {}\n\
+             RUN dnf install -y --setopt=install_weak_deps=False \
+             ca-certificates curl iputils vim-enhanced libgomp libstdc++ libcurl jq python3 \
+             && dnf clean all\n",
+            base_preset.image()
+        );
+    }
+
     let mut containerfile = format!(
         "FROM {}\nENV DEBIAN_FRONTEND=noninteractive\n",
         base_preset.image()
@@ -60,11 +93,35 @@ fn generate_containerfile(base_preset: Preset, presets: &[Preset]) -> String {
     let mut apt_packages: Vec<&str> = vec!["ca-certificates", "curl", "iputils-ping", "vim"];
     let mut extra_run_steps: Vec<&str> = Vec::new();
     let has_latex = presets.contains(&Preset::Latex);
+    let has_julia = presets.contains(&Preset::Julia);
+    let has_bitcoin = presets.contains(&Preset::Bitcoin);
+    let has_k8s = presets.contains(&Preset::K8s);
+    let has_kali = presets.contains(&Preset::Kali);
 
     if has_latex {
         // Provide standard system fonts (LiberationSerif/Sans/Mono, DejaVu) and fontconfig
         // so XeLaTeX/LuaLaTeX documents using system fonts compile cleanly.
         apt_packages.extend(["fontconfig", "fonts-liberation", "fonts-dejavu-core"]);
+    }
+
+    if has_kali {
+        apt_packages.extend([
+            "dnsutils",
+            "git",
+            "jq",
+            "netcat-openbsd",
+            "nmap",
+            "traceroute",
+            "whois",
+        ]);
+    }
+
+    if has_k8s {
+        apt_packages.push("jq");
+    }
+
+    if has_bitcoin {
+        apt_packages.extend(["gzip", "tar"]);
     }
 
     for p in presets {
@@ -92,7 +149,14 @@ fn generate_containerfile(base_preset: Preset, presets: &[Preset]) -> String {
                     "texlive-latex-extra",
                 ]);
             }
-            Preset::Alpine => unreachable!(),
+            Preset::Julia => {
+                // Installed via apt when combined under a higher-priority Debian base (e.g. Kali)
+                apt_packages.push("julia");
+            }
+            Preset::Bitcoin | Preset::K8s | Preset::Kali => {
+                // Handled by capability flags above / binary steps below
+            }
+            Preset::Alpine | Preset::Llama => unreachable!(),
         }
     }
 
@@ -102,6 +166,40 @@ fn generate_containerfile(base_preset: Preset, presets: &[Preset]) -> String {
         "RUN apt-get update && apt-get install -y --no-install-recommends {} && rm -rf /var/lib/apt/lists/*\n",
         apt_packages.join(" ")
     ));
+
+    if has_bitcoin {
+        extra_run_steps.push(
+            "RUN ARCH=$(uname -m) && \
+             case \"$ARCH\" in x86_64|aarch64) ;; *) echo \"Unsupported arch: $ARCH\" >&2; exit 1 ;; esac && \
+             VER=$(curl -fsSL https://bitcoincore.org/bin/ | grep -oE 'bitcoin-core-[0-9]+\\.[0-9]+(\\.[0-9]+)?/' | sed 's|bitcoin-core-||;s|/||' | sort -V | tail -n1) && \
+             VER=${VER:-28.1} && \
+             curl -fsSL \"https://bitcoincore.org/bin/bitcoin-core-${VER}/bitcoin-${VER}-${ARCH}-linux-gnu.tar.gz\" | \
+             tar -xz -C /usr/local --strip-components=1 --wildcards '*/bin/*' && \
+             chmod a+rx /usr/local/bin/bitcoin*",
+        );
+    }
+
+    if has_k8s {
+        extra_run_steps.push(
+            "RUN ARCH=$(uname -m) && \
+             case \"$ARCH\" in x86_64) KARCH=amd64 ;; aarch64) KARCH=arm64 ;; *) echo \"Unsupported arch: $ARCH\" >&2; exit 1 ;; esac && \
+             KVER=$(curl -fsSL https://dl.k8s.io/release/stable.txt) && \
+             curl -fsSL -o /usr/local/bin/kubectl \"https://dl.k8s.io/release/${KVER}/bin/linux/${KARCH}/kubectl\" && \
+             chmod +x /usr/local/bin/kubectl",
+        );
+    }
+
+    if has_julia {
+        // Pre-install Pluto.jl into a shared read-only depot at /usr/local/share/julia using
+        // `JULIA_CPU_TARGET=generic` so the precompile cache matches KVM microVM CPUID masks
+        // and loads instantly without recompiling at runtime.
+        extra_run_steps.push(
+            "RUN JULIA_DEPOT_PATH=/usr/local/share/julia JULIA_CPU_TARGET=generic julia -e 'using Pkg; Pkg.add(\"Pluto\"); using Pluto' && \
+             chmod -R a+rX /usr/local/share/julia && \
+             printf '#!/bin/sh\\nexec julia -e \"import Pluto; Pluto.run(host=\\\"0.0.0.0\\\", port=parse(Int, get(ENV, \\\"PLUTO_PORT\\\", \\\"8888\\\")), launch_browser=false)\"\\n' > /usr/local/bin/pluto && \
+             chmod +x /usr/local/bin/pluto",
+        );
+    }
 
     if has_latex {
         // Pre-populate fontconfig and luaotfload font databases into TEXMFSYSVAR inside the image
@@ -139,7 +237,14 @@ pub fn build_combined_image(cli: &Cli, presets: &[Preset]) -> (String, String) {
 
     if unique.len() > 1 && unique.contains(&Preset::Alpine) {
         eprintln!(
-            "ERROR: Cannot combine `alpine` (musl/apk) with Debian-based presets (python, rust, node, latex)."
+            "ERROR: Cannot combine `alpine` (musl/apk) with Debian or Fedora presets."
+        );
+        process::exit(1);
+    }
+
+    if unique.len() > 1 && unique.contains(&Preset::Llama) {
+        eprintln!(
+            "ERROR: Cannot combine `llama` (Fedora/dnf base for host glibc compatibility) with Debian/Alpine presets."
         );
         process::exit(1);
     }
@@ -244,5 +349,45 @@ mod tests {
             parse_presets_from_env_label("latex+python"),
             vec![Preset::Latex, Preset::Python]
         );
+        assert_eq!(
+            parse_presets_from_env_label("bitcoin+julia+k8s+kali+llama"),
+            vec![
+                Preset::Bitcoin,
+                Preset::Julia,
+                Preset::K8s,
+                Preset::Kali,
+                Preset::Llama
+            ]
+        );
+    }
+
+    #[test]
+    fn new_presets_generate_expected_containerfiles() {
+        let julia_cf = generate_containerfile(Preset::Julia, &[Preset::Julia]);
+        assert!(julia_cf.contains("FROM docker.io/library/julia:latest"));
+        assert!(julia_cf.contains("Pluto"));
+        assert!(julia_cf.contains("/usr/local/bin/pluto"));
+        assert!(julia_cf.contains("curl"));
+        assert!(julia_cf.contains("iputils-ping"));
+        assert!(julia_cf.contains("vim"));
+
+        let btc_cf = generate_containerfile(Preset::Bitcoin, &[Preset::Bitcoin]);
+        assert!(btc_cf.contains("bitcoincore.org/bin/"));
+        assert!(btc_cf.contains("chmod a+rx /usr/local/bin/bitcoin*"));
+
+        let k8s_cf = generate_containerfile(Preset::K8s, &[Preset::K8s]);
+        assert!(k8s_cf.contains("dl.k8s.io/release"));
+        assert!(k8s_cf.contains("/usr/local/bin/kubectl"));
+
+        let kali_cf = generate_containerfile(Preset::Kali, &[Preset::Kali]);
+        assert!(kali_cf.contains("FROM docker.io/kalilinux/kali-rolling"));
+        assert!(kali_cf.contains("nmap"));
+        assert!(kali_cf.contains("vim"));
+
+        let llama_cf = generate_containerfile(Preset::Llama, &[Preset::Llama]);
+        assert!(llama_cf.contains("FROM docker.io/library/fedora:latest"));
+        assert!(llama_cf.contains("dnf install"));
+        assert!(llama_cf.contains("libgomp"));
+        assert!(llama_cf.contains("vim-enhanced"));
     }
 }

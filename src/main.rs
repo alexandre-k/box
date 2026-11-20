@@ -47,6 +47,16 @@ fn main() {
         return;
     }
 
+    if let Some(ref paths_box) = cli.paths {
+        let filter = if paths_box.is_empty() {
+            None
+        } else {
+            Some(paths_box.as_str())
+        };
+        runtime::show_storage_paths(&cli, filter);
+        return;
+    }
+
     if let Some(ref target_box) = cli.attach {
         runtime::attach_box(&cli, target_box);
         return;

@@ -58,7 +58,12 @@ impl VmRuntime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum Preset {
     Alpine,
+    Bitcoin,
+    Julia,
+    K8s,
+    Kali,
     Latex,
+    Llama,
     Node,
     Python,
     Rust,
@@ -72,6 +77,11 @@ impl Preset {
             Preset::Node => "docker.io/library/node:22-slim",
             Preset::Latex => "docker.io/texlive/texlive:latest",
             Preset::Alpine => "docker.io/library/alpine:latest",
+            Preset::Julia => "docker.io/library/julia:latest",
+            Preset::Bitcoin => "docker.io/library/debian:trixie-slim",
+            Preset::K8s => "docker.io/library/debian:trixie-slim",
+            Preset::Kali => "docker.io/kalilinux/kali-rolling",
+            Preset::Llama => "docker.io/library/fedora:latest",
         }
     }
 
@@ -82,15 +92,25 @@ impl Preset {
             Preset::Node => "node",
             Preset::Latex => "latex",
             Preset::Alpine => "alpine",
+            Preset::Julia => "julia",
+            Preset::Bitcoin => "bitcoin",
+            Preset::K8s => "k8s",
+            Preset::Kali => "kali",
+            Preset::Llama => "llama",
         }
     }
 
     pub fn base_priority(&self) -> u8 {
         match self {
+            Preset::Llama => 8,
+            Preset::Kali => 7,
+            Preset::Julia => 6,
             Preset::Latex => 5,
             Preset::Rust => 4,
             Preset::Node => 3,
             Preset::Python => 2,
+            Preset::Bitcoin => 2,
+            Preset::K8s => 2,
             Preset::Alpine => 1,
         }
     }
@@ -115,7 +135,11 @@ pub struct Cli {
     #[arg(long, visible_alias = "info", value_name = "BOX")]
     pub inspect: Option<String>,
 
-    /// Attach to an existing box by name or ID (spawns a fresh sibling VM if already running; starts & enters if stopped)
+    /// Show where box data, mounted workspaces, /opt/venv volumes, images, and logs are stored on the host (optionally filter by BOX name)
+    #[arg(long, visible_alias = "where", value_name = "BOX", num_args = 0..=1, default_missing_value = "")]
+    pub paths: Option<String>,
+
+    /// Attach to an existing box by name or ID (auto-creates if BOX matches a preset; runs interactive shell by default, or spawns a sibling VM if running or given a command)
     #[arg(short = 'a', long, value_name = "BOX")]
     pub attach: Option<String>,
 
@@ -211,7 +235,15 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub expose_port: bool,
 
-    /// One or more toolchain presets, comma-separated or repeated (e.g., --preset latex,python)
+    /// Forward a host loopback port (e.g. 8080 for host llama-server, 8332 for bitcoind, 6443 for k8s) into the VM as http://host.box.internal:<PORT> (169.254.2.2)
+    #[arg(long, visible_alias = "llama-host-port", value_name = "PORT")]
+    pub host_port: Option<u16>,
+
+    /// Mount a host-compiled llama-server binary or build/bin directory read-only at /opt/llama (added to PATH and LD_LIBRARY_PATH)
+    #[arg(long, value_name = "PATH")]
+    pub llama_bin: Option<PathBuf>,
+
+    /// One or more toolchain presets, comma-separated or repeated (e.g., --preset julia, --preset bitcoin, --preset k8s, --preset llama, --preset kali, --preset latex,python)
     #[arg(long, value_enum, value_delimiter = ',')]
     pub preset: Vec<Preset>,
 
