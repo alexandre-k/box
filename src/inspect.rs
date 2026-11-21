@@ -5,10 +5,10 @@ use std::process;
 use crate::cli::{Cli, NetMode, VmRuntime};
 use crate::dns::{audit_log_path, pcap_archive_dir};
 use crate::domains::default_domains_path;
-use crate::images::infer_env_from_image;
+use crate::images::{generate_spec_from_config, infer_env_from_image};
 use crate::runtime::{
-    clean_template_val, container_cmd, extract_pcap_from_netmode, infer_net_mode, parse_cmd_field,
-    resolve_container_storage_root, resolve_volume_host_path,
+    clean_template_val, container_cmd, extract_pcap_from_netmode, find_matching_yaml_config,
+    infer_net_mode, parse_cmd_field, resolve_container_storage_root, resolve_volume_host_path,
 };
 
 #[derive(Debug)]
@@ -35,6 +35,8 @@ struct ContainerStackInfo {
     cmd: String,
     host_port: Option<u16>,
     llama_bin: Option<String>,
+    spec_hash: Option<String>,
+    spec_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -97,7 +99,7 @@ fn query_container_info(cli: &Cli, target: &str) -> ContainerStackInfo {
         VmRuntime::Kata => "{{.HostConfig.Runtime}}",
     };
     let fmt = format!(
-        "{{{{.Id}}}}\t{{{{.Name}}}}\t{{{{.State.Status}}}}\t{}\t{{{{.Config.Image}}}}\t{{{{.HostConfig.ReadonlyRootfs}}}}\t{{{{.Config.User}}}}\t{{{{.HostConfig.UsernsMode}}}}\t{{{{.HostConfig.Memory}}}}\t{{{{.HostConfig.PidsLimit}}}}\t{{{{.HostConfig.CapDrop}}}}\t{{{{.HostConfig.NetworkMode}}}}\t{{{{index .Config.Labels \"box.managed\"}}}}\t{{{{index .Config.Labels \"box.preset\"}}}}\t{{{{index .Config.Labels \"box.workspace\"}}}}\t{{{{index .Config.Labels \"box.net\"}}}}\t{{{{index .Config.Labels \"box.rw\"}}}}\t{{{{index .Config.Labels \"box.venv\"}}}}\t{{{{index .Config.Labels \"box.pcap\"}}}}\t{{{{index .Config.Labels \"box.host_port\"}}}}\t{{{{index .Config.Labels \"box.llama_bin\"}}}}\t{{{{json .Config.Cmd}}}}",
+        "{{{{.Id}}}}\t{{{{.Name}}}}\t{{{{.State.Status}}}}\t{}\t{{{{.Config.Image}}}}\t{{{{.HostConfig.ReadonlyRootfs}}}}\t{{{{.Config.User}}}}\t{{{{.HostConfig.UsernsMode}}}}\t{{{{.HostConfig.Memory}}}}\t{{{{.HostConfig.PidsLimit}}}}\t{{{{.HostConfig.CapDrop}}}}\t{{{{.HostConfig.NetworkMode}}}}\t{{{{index .Config.Labels \"box.managed\"}}}}\t{{{{index .Config.Labels \"box.preset\"}}}}\t{{{{index .Config.Labels \"box.workspace\"}}}}\t{{{{index .Config.Labels \"box.net\"}}}}\t{{{{index .Config.Labels \"box.rw\"}}}}\t{{{{index .Config.Labels \"box.venv\"}}}}\t{{{{index .Config.Labels \"box.pcap\"}}}}\t{{{{index .Config.Labels \"box.host_port\"}}}}\t{{{{index .Config.Labels \"box.llama_bin\"}}}}\t{{{{json .Config.Cmd}}}}\t{{{{index .Config.Labels \"box.spec.hash\"}}}}\t{{{{index .Config.Labels \"box.spec.file\"}}}}",
         runtime_field
     );
 
@@ -172,6 +174,8 @@ fn query_container_info(cli: &Cli, target: &str) -> ContainerStackInfo {
     } else {
         cmd_tokens.join(" ")
     };
+    let spec_hash = clean_template_val(cols.get(22));
+    let spec_file = clean_template_val(cols.get(23)).map(PathBuf::from);
 
     ContainerStackInfo {
         id,
@@ -196,6 +200,8 @@ fn query_container_info(cli: &Cli, target: &str) -> ContainerStackInfo {
         cmd,
         host_port,
         llama_bin,
+        spec_hash,
+        spec_file,
     }
 }
 
@@ -403,6 +409,26 @@ pub fn inspect_box_stack(cli: &Cli, target: &str) {
         }
     );
     println!("  Preset / Env     : {}", info.preset);
+    if let Ok(Some(cfg)) = find_matching_yaml_config(
+        &info.name,
+        &info.preset,
+        info.spec_file.as_deref(),
+        cli.images_dir.as_deref(),
+    ) {
+        let sync_note = match generate_spec_from_config(&cfg) {
+            Ok(spec) if info.spec_hash.as_deref() == Some(spec.spec_hash.as_str()) => {
+                "in sync"
+            }
+            Ok(_) => "CHANGED — auto-rebuilds on next `box --attach`",
+            Err(_) => "parse/config error",
+        };
+        println!(
+            "  Image YAML       : {} ({}, {})",
+            cfg.source_path.display(),
+            cfg.package_summary(),
+            sync_note
+        );
+    }
     println!("  Command          : {}", info.cmd);
     println!("--------------------------------------------------------------------------------");
     println!("  HARDENING, MOUNTS & NETWORK");

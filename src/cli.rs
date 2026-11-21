@@ -139,6 +139,26 @@ pub struct Cli {
     #[arg(long, visible_alias = "where", value_name = "BOX", num_args = 0..=1, default_missing_value = "")]
     pub paths: Option<String>,
 
+    /// List YAML image definitions in ~/.config/box/images/ and show whether each image/VM is up-to-date or needs rebuild
+    #[arg(long, default_value_t = false)]
+    pub images: bool,
+
+    /// Rebuild YAML-defined images whose package list has changed (optionally specify a single image/VM name)
+    #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+    pub sync: Option<String>,
+
+    /// Generate a starter ~/.config/box/images/<NAME>.yaml file for customizing packages
+    #[arg(long, value_name = "NAME")]
+    pub init_image: Option<String>,
+
+    /// Path to a specific YAML image/package definition file (e.g. ./rust.yaml); VM name defaults to the file stem
+    #[arg(long, visible_alias = "image-config", value_name = "FILE")]
+    pub config: Option<PathBuf>,
+
+    /// Directory searched for <name>.yaml image definitions (default: ~/.config/box/images)
+    #[arg(long, value_name = "DIR")]
+    pub images_dir: Option<PathBuf>,
+
     /// Attach to an existing box by name or ID (auto-creates if BOX matches a preset; runs interactive shell by default, or spawns a sibling VM if running or given a command)
     #[arg(short = 'a', long, value_name = "BOX")]
     pub attach: Option<String>,

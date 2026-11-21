@@ -14,7 +14,10 @@ User CLI (`box ...`)
   ├── --list              ──▶ runtime::list_boxes()         (podman/nerdctl ps --filter label=box.managed=true)
   ├── --verify            ──▶ runtime::verify_isolation()   (inspect host stack + live microVM kernel/virtiofs probe)
   ├── --inspect <box>     ──▶ inspect::inspect_box_stack()  (container runtime/Kata vs libkrun, image, OS, installed tools & packages)
-  ├── --attach <box> (-a) ──▶ runtime::attach_box()         (attach if Up, start -ai if Exited, recreate if --mount-cwd/-d)
+  ├── --images            ──▶ images::list_configured_images() (list ~/.config/box/images/*.yaml definitions & sync status)
+  ├── --sync [name]       ──▶ images::sync_configured_images() (rebuild out-of-date YAML-defined images)
+  ├── --init-image <name> ──▶ images::init_image_config()   (create starter ~/.config/box/images/<name>.yaml)
+  ├── --attach <box> (-a) ──▶ runtime::attach_box()         (attach if Up, start -ai if Exited, auto-rebuild/recreate on YAML change)
   ├── --traffic           ──▶ telemetry::show_traffic_dashboard()
   │   ├── --follow (-f)   ──▶ telemetry::follow_traffic()   (live color-coded terminal tail)
   │   └── --web           ──▶ web::serve_traffic_ui()       (live local browser UI via SSE)
@@ -38,7 +41,8 @@ User CLI (`box ...`)
 | `src/cli.rs` | `clap` CLI definition (`Cli`), `NetMode`, `VmRuntime`, and `Preset` metadata. |
 | `src/runtime.rs` | KVM/runtime checks, workspace path validation, hardening flags, mounts, network config, `list_boxes`, `attach_box`, `verify_isolation`, and `run_box`. |
 | `src/inspect.rs` | `--inspect <BOX>` full software stack report (OCI runtime / Kata vs libkrun, image metadata, live OS/kernel probe, installed compilers/tools & packages). |
-| `src/images.rs` | Single-preset image lookup, combined multi-preset `Containerfile` generation and build caching, and image-to-environment inference. |
+| `src/image_config.rs` | Zero-dependency YAML image/package definition loader (`~/.config/box/images/<name>.yaml`), package validation, starter template generator, and SHA-256 spec fingerprinting. |
+| `src/images.rs` | Single/combined preset & YAML-driven `Containerfile` generation, automatic hash-based image rebuilds, `--images`, `--sync`, `--init-image`, and image-to-environment inference. |
 | `src/pcap.rs` | Background `pasta --pcap` tailer, query/response correlation, tmpfs `fallocate` hole punching, and cleanup. |
 | `src/dns.rs` | Ethernet/IPv4/IPv6/UDP/TCP DNS query & response (`A`/`AAAA`) parsing, local timestamp formatting, and JSONL audit log read/write. |
 | `src/domains.rs` | Domain allowlist/blocklist loader & rule updater (`~/.config/box/domains.txt` / `--domains`), built-in dev registries, and suspicious-domain heuristics. |
@@ -130,6 +134,31 @@ Pass one or more `--preset` values (`alpine`, `bitcoin`, `julia`, `k8s`, `kali`,
   - **`kali`**: `kalilinux/kali-rolling` with lightweight recon/network essentials (`nmap`, `dnsutils`, `netcat-openbsd`, `whois`, `traceroute`, `jq`, `git`) and full Kali `apt` repos.
   - **`latex`**, **`python`**, **`rust`**, **`node`**, **`alpine`**: Existing presets with persistent `/opt/venv` caches (Python venv auto-activated; `luaotfload` & Liberation/DejaVu fonts prebuilt for LaTeX).
 - **Multiple Debian presets** (e.g. `--preset latex,python`, `--preset k8s,python`, `--preset kali,k8s`) combine automatically (`kali > julia > latex > rust > node > python/bitcoin/k8s`). `alpine` (musl/apk) and `llama` (Fedora/dnf) cannot be combined with Debian presets.
+- **Per-image YAML package customization (`~/.config/box/images/<name>.yaml`):**
+  - Create a YAML file named after your VM/image (e.g., `~/.config/box/images/rust.yaml` for VM `rust`, or `~/.config/box/images/datasci.yaml` for a custom VM named `datasci`) — or generate one with `box --init-image rust`.
+  - Files in `~/.config/box/images/<name>.yaml` (or `.yml`, with fallback to `~/.config/box/<name>.yaml`, or explicit `--config <FILE>` / `--images-dir <DIR>`) are automatically detected whenever you run `box --attach <name>`, `box --preset <name>`, `box --name <name>`, or `box --sync`.
+  - Every built image embeds a SHA-256 `box.spec.hash` label computed from its generated `Containerfile`. Whenever you add, remove, or edit packages in `<name>.yaml`, `box` **automatically rebuilds the image and recreates the stopped VM** on next launch/attach (preserving `/workspace`, network mode, and `/opt/venv`).
+  - Supported YAML fields:
+    - `preset` / `presets`: built-in preset(s) (inferred automatically from the filename if omitted, e.g. `rust.yaml` -> `rust`).
+    - `base` (aliases: `from`, `image`): any OCI base image (e.g. `docker.io/library/ubuntu:24.04`).
+    - `pkg_manager`: optional override (`apt`, `apk`, `dnf`; auto-detected from preset/base).
+    - `include_defaults`: `true` (default) or `false` (install strictly only the packages you list).
+    - `packages` (aliases: `apt`, `apk`, `dnf`, `system_packages`): OS packages to install (a bare top-level YAML list is also accepted as shorthand).
+    - `exclude_packages` (aliases: `exclude`, `remove`): omit specific default packages (e.g. `vim`).
+    - `pip`, `cargo`, `npm`, `julia`: ecosystem packages baked directly into the read-only image.
+    - `env`: key-value map of `ENV` variables baked into the image.
+    - `run`: custom shell `RUN` commands.
+  - Example `~/.config/box/images/rust.yaml`:
+    ```yaml
+    packages:
+      - git
+      - ripgrep
+      - fd-find
+      - pkg-config
+      - libssl-dev
+    cargo:
+      - cargo-watch
+    ```
 - **Host storage visibility:**
   - Every launch/attach header prints the exact host paths for `/workspace`, `/opt/venv` (resolved Podman volume mountpoint), `/opt/llama` (if set), and `/tmp` (ephemeral RAM).
   - From the host, run `box --paths` (alias `box --where`) or `box --paths <BOX>` / `box --inspect <BOX>` to inspect where all workspaces, `/opt/venv` data, container images, traffic logs, and PCAPs live on disk.
@@ -220,4 +249,11 @@ box --attach my-rust                       # Starts if stopped; spawns a fresh s
 box --attach my-rust --new                 # Always spawn a fresh sibling VM with the same config
 box --attach my-rust --same-tty            # Reconnect directly to a detached running process's TTY
 box --attach my-rust --mount-cwd --rw      # Mount current directory read-write at /workspace
+
+# Customize packages per image via YAML (~/.config/box/images/<name>.yaml)
+box --init-image rust                      # Create starter ~/.config/box/images/rust.yaml
+box --images                               # List YAML image definitions & rebuild status
+box --sync                                 # Rebuild any YAML images whose package list changed
+box --attach rust                          # Automatically rebuilds image & recreates VM when rust.yaml changes
+box --config ./custom.yaml                 # Launch directly from a specific YAML file
 ```

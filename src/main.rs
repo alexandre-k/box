@@ -1,6 +1,7 @@
 mod cli;
 mod dns;
 mod domains;
+mod image_config;
 mod images;
 mod inspect;
 mod pcap;
@@ -54,6 +55,26 @@ fn main() {
             Some(paths_box.as_str())
         };
         runtime::show_storage_paths(&cli, filter);
+        return;
+    }
+
+    if cli.images {
+        images::list_configured_images(&cli);
+        return;
+    }
+
+    if let Some(ref sync_target) = cli.sync {
+        let filter = if sync_target.is_empty() {
+            None
+        } else {
+            Some(sync_target.as_str())
+        };
+        images::sync_configured_images(&cli, filter);
+        return;
+    }
+
+    if let Some(ref init_name) = cli.init_image {
+        images::init_image_config(&cli, init_name);
         return;
     }
 

@@ -9,7 +9,13 @@ use std::process::{self, Command};
 use crate::cli::{Cli, NetMode, Preset, VmRuntime};
 use crate::dns::{audit_log_path, extract_dns_host_ip, now_epoch, pcap_archive_dir};
 use crate::domains::default_domains_path;
-use crate::images::{build_combined_image, infer_env_from_image, parse_presets_from_env_label};
+use crate::image_config::{
+    ImageConfig, find_image_config, load_image_config_from_path, resolve_images_dir,
+};
+use crate::images::{
+    ResolvedImage, build_combined_image, build_image_from_config, generate_spec_from_config,
+    infer_env_from_image, normalize_image_id, parse_presets_from_env_label,
+};
 use crate::pcap::{cmd_tracker_path, spawn_pcap_dns_auditor, spawn_pcap_dns_auditor_at};
 
 #[derive(Debug)]
@@ -26,6 +32,7 @@ struct BoxInspect {
     running: bool,
     name: String,
     image: String,
+    image_id: String,
     network_mode: String,
     preset: String,
     workspace: String,
@@ -41,12 +48,18 @@ struct BoxInspect {
     is_toolbox: bool,
     host_port: Option<u16>,
     llama_bin: Option<PathBuf>,
+    spec_hash: Option<String>,
+    spec_file: Option<PathBuf>,
+    base_presets: Vec<Preset>,
 }
 
 struct BoxSpec {
     box_name: String,
     image: String,
     env_label: String,
+    presets: Vec<Preset>,
+    spec_hash: Option<String>,
+    spec_file: Option<PathBuf>,
     target_dir: PathBuf,
     effective_cmd: Vec<String>,
     runtime: VmRuntime,
@@ -63,6 +76,12 @@ struct BoxSpec {
     pids_limit: u32,
     sudo: bool,
     upstream_dns: String,
+}
+
+impl BoxSpec {
+    fn has_preset(&self, p: Preset) -> bool {
+        self.presets.contains(&p) || self.env_label.contains(p.as_str())
+    }
 }
 
 pub fn container_cmd(bin: &str, use_sudo: bool) -> Command {
@@ -84,6 +103,28 @@ pub(crate) fn clean_template_val(s: Option<&&str>) -> Option<String> {
     }
 }
 
+pub(crate) fn find_matching_yaml_config(
+    box_name: &str,
+    preset_label: &str,
+    spec_file_label: Option<&Path>,
+    images_dir_override: Option<&Path>,
+) -> Result<Option<ImageConfig>, String> {
+    if let Some(cfg) = find_image_config(box_name, images_dir_override)? {
+        return Ok(Some(cfg));
+    }
+    if let Some(path) = spec_file_label {
+        if path.is_file() {
+            return load_image_config_from_path(path, None).map(Some);
+        }
+    }
+    if !preset_label.is_empty() && preset_label != box_name {
+        if let Some(cfg) = find_image_config(preset_label, images_dir_override)? {
+            return Ok(Some(cfg));
+        }
+    }
+    Ok(None)
+}
+
 pub fn list_boxes(cli: &Cli) {
     let bin = cli.runtime.container_bin();
     let mut cmd = container_cmd(bin, cli.sudo);
@@ -94,7 +135,7 @@ pub fn list_boxes(cli: &Cli) {
         "--filter",
         "label=box.managed=true",
         "--format",
-        "{{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Label \"box.preset\"}}\t{{.Label \"box.workspace\"}}\t{{.Label \"box.runtime\"}}",
+        "{{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Label \"box.preset\"}}\t{{.Label \"box.workspace\"}}\t{{.Label \"box.runtime\"}}\t{{.Label \"box.spec.hash\"}}\t{{.Label \"box.spec.file\"}}",
     ]);
 
     let output = cmd.output().unwrap_or_else(|e| {
@@ -124,13 +165,28 @@ pub fn list_boxes(cli: &Cli) {
 
         let id = cols[0].chars().take(12).collect::<String>();
         let name = cols[1].to_string();
-        let status = cols[2].to_string();
+        let mut status = cols[2].to_string();
         let image = cols[3].to_string();
 
         let env_name =
             clean_template_val(cols.get(4)).unwrap_or_else(|| infer_env_from_image(&image));
         let workspace = clean_template_val(cols.get(5)).unwrap_or_else(|| "-".to_string());
         let runtime = clean_template_val(cols.get(6)).unwrap_or_else(|| bin.to_string());
+        let saved_spec_hash = clean_template_val(cols.get(7));
+        let saved_spec_file = clean_template_val(cols.get(8)).map(PathBuf::from);
+
+        if let Ok(Some(cfg)) = find_matching_yaml_config(
+            &name,
+            &env_name,
+            saved_spec_file.as_deref(),
+            cli.images_dir.as_deref(),
+        ) {
+            if let Ok(spec) = generate_spec_from_config(&cfg) {
+                if saved_spec_hash.as_deref() != Some(spec.spec_hash.as_str()) {
+                    status.push_str(" [rebuild pending]");
+                }
+            }
+        }
 
         grouped.entry(env_name).or_default().push(BoxRecord {
             id,
@@ -314,6 +370,18 @@ pub fn show_storage_paths(cli: &Cli, filter_box: Option<&str>) {
         println!("  Traffic Log      : {}", audit_log_path().display());
         println!("  PCAP Archive     : {}", pcap_archive_dir().display());
         println!("  Domain Rules     : {}", default_domains_path().display());
+        println!(
+            "  Image Configs    : {}",
+            resolve_images_dir(cli.images_dir.as_deref()).display()
+        );
+        if let Ok(Some(cfg)) = find_matching_yaml_config(
+            &info.name,
+            &info.preset,
+            info.spec_file.as_deref(),
+            cli.images_dir.as_deref(),
+        ) {
+            println!("  Image YAML       : {}", cfg.source_path.display());
+        }
         if let Some(ref pcap) = info.pcap {
             println!("  Live Capture     : {}", pcap.display());
         }
@@ -328,6 +396,10 @@ pub fn show_storage_paths(cli: &Cli, filter_box: Option<&str>) {
     println!("  Traffic Log      : {}", audit_log_path().display());
     println!("  PCAP Archive     : {}", pcap_archive_dir().display());
     println!("  Domain Rules     : {}", default_domains_path().display());
+    println!(
+        "  Image Configs    : {}",
+        resolve_images_dir(cli.images_dir.as_deref()).display()
+    );
     println!("  Temp RAM (/tmp)  : ephemeral tmpfs inside VM (not persisted on host)");
     println!("--------------------------------------------------------------------------------");
     println!("  SAVED BOX MOUNTS (files saved in /workspace or /opt/venv appear at these host paths)");
@@ -578,6 +650,21 @@ fn configure_hardening_and_mounts(
     ]);
     if let Some(hp) = spec.host_port {
         command.args(["--label", &format!("box.host_port={}", hp)]);
+    }
+    if let Some(ref hash) = spec.spec_hash {
+        command.args(["--label", &format!("box.spec.hash={}", hash)]);
+    }
+    if let Some(ref file) = spec.spec_file {
+        command.args(["--label", &format!("box.spec.file={}", file.display())]);
+    }
+    if !spec.presets.is_empty() {
+        let base_presets = spec
+            .presets
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join("+");
+        command.args(["--label", &format!("box.base_presets={}", base_presets)]);
     }
 
     let llama_mount: Option<(PathBuf, String)> = spec
@@ -861,6 +948,8 @@ struct BoxHeader<'a> {
     mode: &'a str,
     name: &'a str,
     env_label: &'a str,
+    presets: &'a [Preset],
+    spec_file: Option<&'a str>,
     image: &'a str,
     runtime_label: &'a str,
     workspace: &'a str,
@@ -896,13 +985,14 @@ fn print_box_header(h: &BoxHeader<'_>) {
         NetMode::Local => ansi(color, "36", &format!("local ({})", h.net_detail)),
         NetMode::Internet => ansi(color, "33", &format!("internet ({})", h.net_detail)),
     };
-    let venv_hint = if h.env_label.contains("python") {
+    let has_preset = |p: Preset| h.presets.contains(&p) || h.env_label.contains(p.as_str());
+    let venv_hint = if has_preset(Preset::Python) {
         " (python auto-activated)"
-    } else if h.env_label.contains("julia") {
+    } else if has_preset(Preset::Julia) {
         " (julia depot)"
-    } else if h.env_label.contains("bitcoin") {
+    } else if has_preset(Preset::Bitcoin) {
         " (bitcoin datadir)"
-    } else if h.env_label.contains("k8s") {
+    } else if has_preset(Preset::K8s) {
         " (kubeconfig)"
     } else {
         ""
@@ -939,6 +1029,14 @@ fn print_box_header(h: &BoxHeader<'_>) {
         ansi(color, "1", h.env_label),
         ansi(color, "2", &format!("({})", h.image))
     );
+    if let Some(sf) = h.spec_file {
+        println!(
+            "{}  {}  {}",
+            bar,
+            ansi(color, "2", "Config   :"),
+            ansi(color, "36", sf)
+        );
+    }
     println!(
         "{}  {}  {}  {}  {}",
         bar,
@@ -1005,7 +1103,7 @@ fn build_container_exec_cmd(spec: &BoxSpec) -> Vec<String> {
     let is_interactive_bash = spec.effective_cmd.len() == 1 && spec.effective_cmd[0] == "bash";
     if is_interactive_bash {
         let mut init_script = String::new();
-        let auto_python = spec.venv.is_some() && spec.env_label.contains("python");
+        let auto_python = spec.venv.is_some() && spec.has_preset(Preset::Python);
         if auto_python {
             init_script.push_str(
                 r#"if [ ! -x /opt/venv/python/bin/python3 ] && command -v python3 >/dev/null 2>&1; then
@@ -1016,7 +1114,7 @@ fi
             );
         }
 
-        if spec.venv.is_some() && spec.env_label.contains("bitcoin") {
+        if spec.venv.is_some() && spec.has_preset(Preset::Bitcoin) {
             init_script.push_str(
                 "mkdir -p /opt/venv/bitcoin 2>/dev/null || true\n\
                  ln -sfn /opt/venv/bitcoin /tmp/.bitcoin 2>/dev/null || true\n",
@@ -1166,11 +1264,14 @@ fn launch_box(spec: &BoxSpec, launch_mode: &str) -> ! {
     };
     let workspace_str = spec.target_dir.display().to_string();
     let llama_host_str = llama_host_src.as_ref().map(|p| p.display().to_string());
+    let spec_file_str = spec.spec_file.as_ref().map(|p| p.display().to_string());
 
     print_box_header(&BoxHeader {
         mode: launch_mode,
         name: &spec.box_name,
         env_label: &spec.env_label,
+        presets: &spec.presets,
+        spec_file: spec_file_str.as_deref(),
         image: &spec.image,
         runtime_label: &runtime_desc,
         workspace: &workspace_str,
@@ -1207,11 +1308,66 @@ pub fn run_box(cli: &Cli) {
     });
     let target_dir = validate_target_dir(&raw_dir);
 
-    let (image, env_label) = if let Some(ref custom_img) = cli.image {
-        (custom_img.clone(), infer_env_from_image(custom_img))
-    } else {
-        build_combined_image(cli, &cli.preset)
-    };
+    let (image, env_label, presets, spec_hash, spec_file, has_bash) =
+        if let Some(ref cfg_path) = cli.config {
+            let cfg = load_image_config_from_path(cfg_path, None).unwrap_or_else(|e| {
+                eprintln!("ERROR: {}", e);
+                process::exit(1);
+            });
+            let res = build_image_from_config(cli, &cfg);
+            (
+                res.tag,
+                res.env_label,
+                res.presets,
+                Some(res.spec_hash),
+                res.spec_file,
+                res.has_bash,
+            )
+        } else if let Some(ref custom_img) = cli.image {
+            let env_lbl = infer_env_from_image(custom_img);
+            let is_alpine = env_lbl == "alpine";
+            (
+                custom_img.clone(),
+                env_lbl,
+                Vec::new(),
+                None,
+                None,
+                !is_alpine,
+            )
+        } else if cli.preset.is_empty() {
+            // If `--name <vm>` matches `<vm>.yaml` in ~/.config/box/images/, use it automatically!
+            let named_cfg = if let Some(ref custom_name) = cli.name {
+                find_image_config(custom_name, cli.images_dir.as_deref()).unwrap_or_else(|e| {
+                    eprintln!("ERROR: {}", e);
+                    process::exit(1);
+                })
+            } else {
+                None
+            };
+            let res = if let Some(cfg) = named_cfg {
+                build_image_from_config(cli, &cfg)
+            } else {
+                build_combined_image(cli, &cli.preset)
+            };
+            (
+                res.tag,
+                res.env_label,
+                res.presets,
+                Some(res.spec_hash),
+                res.spec_file,
+                res.has_bash,
+            )
+        } else {
+            let res = build_combined_image(cli, &cli.preset);
+            (
+                res.tag,
+                res.env_label,
+                res.presets,
+                Some(res.spec_hash),
+                res.spec_file,
+                res.has_bash,
+            )
+        };
 
     let box_name = cli.name.clone().unwrap_or_else(|| {
         format!(
@@ -1222,8 +1378,7 @@ pub fn run_box(cli: &Cli) {
     });
 
     let effective_cmd = if cli.cmd.is_empty() {
-        let is_alpine = cli.preset.len() == 1 && cli.preset[0] == Preset::Alpine;
-        vec![if is_alpine { "sh" } else { "bash" }.to_string()]
+        vec![if has_bash { "bash" } else { "sh" }.to_string()]
     } else {
         cli.cmd.clone()
     };
@@ -1240,6 +1395,9 @@ pub fn run_box(cli: &Cli) {
         box_name,
         image,
         env_label,
+        presets,
+        spec_hash,
+        spec_file,
         target_dir,
         effective_cmd,
         runtime: cli.runtime,
@@ -1365,11 +1523,20 @@ fn parse_inspect_output(raw: &str) -> Option<BoxInspect> {
     let cmd = clean_template_val(cols.get(17))
         .map(|s| parse_cmd_field(&s))
         .unwrap_or_default();
+    let image_id = clean_template_val(cols.get(18))
+        .map(|s| normalize_image_id(&s))
+        .unwrap_or_default();
+    let spec_hash = clean_template_val(cols.get(19));
+    let spec_file = clean_template_val(cols.get(20)).map(PathBuf::from);
+    let base_presets = clean_template_val(cols.get(21))
+        .map(|s| parse_presets_from_env_label(&s))
+        .unwrap_or_default();
 
     Some(BoxInspect {
         running,
         name,
         image,
+        image_id,
         network_mode,
         preset,
         workspace,
@@ -1385,11 +1552,14 @@ fn parse_inspect_output(raw: &str) -> Option<BoxInspect> {
         is_toolbox,
         host_port,
         llama_bin,
+        spec_hash,
+        spec_file,
+        base_presets,
     })
 }
 
 fn try_inspect_box(bin: &str, use_sudo: bool, target: &str) -> Option<BoxInspect> {
-    let fmt = "{{.State.Running}}\t{{.Name}}\t{{.Config.Image}}\t{{.HostConfig.NetworkMode}}\t{{index .Config.Labels \"box.preset\"}}\t{{index .Config.Labels \"box.workspace\"}}\t{{index .Config.Labels \"box.runtime\"}}\t{{index .Config.Labels \"box.net\"}}\t{{index .Config.Labels \"box.rw\"}}\t{{index .Config.Labels \"box.venv\"}}\t{{index .Config.Labels \"box.pcap\"}}\t{{index .Config.Labels \"box.userns\"}}\t{{index .Config.Labels \"box.cmdfile\"}}\t{{index .Config.Labels \"box.managed\"}}\t{{index .Config.Labels \"com.github.containers.toolbox\"}}\t{{index .Config.Labels \"box.host_port\"}}\t{{index .Config.Labels \"box.llama_bin\"}}\t{{json .Config.Cmd}}";
+    let fmt = "{{.State.Running}}\t{{.Name}}\t{{.Config.Image}}\t{{.HostConfig.NetworkMode}}\t{{index .Config.Labels \"box.preset\"}}\t{{index .Config.Labels \"box.workspace\"}}\t{{index .Config.Labels \"box.runtime\"}}\t{{index .Config.Labels \"box.net\"}}\t{{index .Config.Labels \"box.rw\"}}\t{{index .Config.Labels \"box.venv\"}}\t{{index .Config.Labels \"box.pcap\"}}\t{{index .Config.Labels \"box.userns\"}}\t{{index .Config.Labels \"box.cmdfile\"}}\t{{index .Config.Labels \"box.managed\"}}\t{{index .Config.Labels \"com.github.containers.toolbox\"}}\t{{index .Config.Labels \"box.host_port\"}}\t{{index .Config.Labels \"box.llama_bin\"}}\t{{json .Config.Cmd}}\t{{.Image}}\t{{index .Config.Labels \"box.spec.hash\"}}\t{{index .Config.Labels \"box.spec.file\"}}\t{{index .Config.Labels \"box.base_presets\"}}";
     let output = container_cmd(bin, use_sudo)
         .args(["container", "inspect", "--format", fmt, target])
         .output()
@@ -1461,19 +1631,41 @@ pub fn attach_box(cli: &Cli, target: &str) {
 
     let bin = cli.runtime.container_bin();
     let Some(info) = try_inspect_box(bin, cli.sudo, target) else {
-        // Box does not exist yet: auto-create it if `target` matches a preset name
-        // (e.g. `box --attach rust --rw`, `box --attach julia --net local`) or if
-        // `--preset` / `--image` was explicitly provided.
+        // Box does not exist yet: auto-create it if:
+        //   1. `--config <FILE>` was provided, OR
+        //   2. `<target>.yaml` / `<target>.yml` exists in `~/.config/box/images/` (or `~/.config/box/`), OR
+        //   3. `target` matches a built-in preset name (e.g. `rust`, `julia`, `latex+python`), OR
+        //   4. `--preset` / `--image` was explicitly provided.
+        let yaml_cfg = if let Some(ref cfg_path) = cli.config {
+            Some(load_image_config_from_path(cfg_path, None).unwrap_or_else(|e| {
+                eprintln!("ERROR: {}", e);
+                process::exit(1);
+            }))
+        } else if cli.image.is_none() && cli.preset.is_empty() {
+            find_image_config(target, cli.images_dir.as_deref()).unwrap_or_else(|e| {
+                eprintln!("ERROR: {}", e);
+                process::exit(1);
+            })
+        } else {
+            None
+        };
+
         let inferred_presets = if !cli.preset.is_empty() {
             cli.preset.clone()
         } else {
             parse_presets_from_env_label(target)
         };
 
-        if cli.image.is_none() && inferred_presets.is_empty() {
+        if yaml_cfg.is_none() && cli.image.is_none() && inferred_presets.is_empty() {
+            let images_dir = resolve_images_dir(cli.images_dir.as_deref());
             eprintln!("ERROR: Could not find box '{}' (runtime: {}).", target, bin);
             eprintln!(
-                "Run `box --list` to see available boxes, or auto-create it with:\n  box --attach {} --preset <rust|python|julia|bitcoin|k8s|llama|kali|latex|node|alpine>",
+                "Run `box --list` to see available boxes, or auto-create it with:\n  \
+                 box --attach {} --preset <rust|python|julia|bitcoin|k8s|llama|kali|latex|node|alpine>\n\
+                 Or define a custom package file at {}/{}.yaml (run `box --init-image {}`).",
+                target,
+                images_dir.display(),
+                target,
                 target
             );
             process::exit(1);
@@ -1483,17 +1675,45 @@ pub fn attach_box(cli: &Cli, target: &str) {
             env::current_dir().expect("Failed to determine current working directory")
         });
         let target_dir = validate_target_dir(&raw_dir);
-        let (image, env_label) = if let Some(ref custom_img) = cli.image {
-            (custom_img.clone(), infer_env_from_image(custom_img))
-        } else {
-            build_combined_image(cli, &inferred_presets)
-        };
+        let (image, env_label, presets, spec_hash, spec_file, has_bash) =
+            if let Some(ref cfg) = yaml_cfg {
+                let res = build_image_from_config(cli, cfg);
+                (
+                    res.tag,
+                    res.env_label,
+                    res.presets,
+                    Some(res.spec_hash),
+                    res.spec_file,
+                    res.has_bash,
+                )
+            } else if let Some(ref custom_img) = cli.image {
+                let env_lbl = infer_env_from_image(custom_img);
+                let is_alpine = env_lbl == "alpine";
+                (
+                    custom_img.clone(),
+                    env_lbl,
+                    Vec::new(),
+                    None,
+                    None,
+                    !is_alpine,
+                )
+            } else {
+                let res = build_combined_image(cli, &inferred_presets);
+                (
+                    res.tag,
+                    res.env_label,
+                    res.presets,
+                    Some(res.spec_hash),
+                    res.spec_file,
+                    res.has_bash,
+                )
+            };
         let effective_cmd = if !cli.cmd.is_empty() {
             cli.cmd.clone()
-        } else if env_label == "alpine" {
-            vec!["sh".to_string()]
-        } else {
+        } else if has_bash {
             vec!["bash".to_string()]
+        } else {
+            vec!["sh".to_string()]
         };
         let effective_net = cli.net.unwrap_or_else(|| {
             if cli.host_port.is_some() {
@@ -1506,6 +1726,9 @@ pub fn attach_box(cli: &Cli, target: &str) {
             box_name: target.to_string(),
             image,
             env_label,
+            presets,
+            spec_hash,
+            spec_file,
             target_dir,
             effective_cmd,
             runtime: cli.runtime,
@@ -1561,6 +1784,56 @@ pub fn attach_box(cli: &Cli, target: &str) {
         }
     });
 
+    // Check whether a YAML image definition applies to this box (or was deleted, or `--rebuild` was passed).
+    // If the package list in the YAML file changed, rebuild the image automatically!
+    let matched_yaml = if let Some(ref cfg_path) = cli.config {
+        Some(load_image_config_from_path(cfg_path, None).unwrap_or_else(|e| {
+            eprintln!("ERROR: {}", e);
+            process::exit(1);
+        }))
+    } else {
+        find_matching_yaml_config(
+            &info.name,
+            &info.preset,
+            info.spec_file.as_deref(),
+            cli.images_dir.as_deref(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: {}", e);
+            process::exit(1);
+        })
+    };
+
+    let resolved_image: Option<ResolvedImage> = if let Some(ref cfg) = matched_yaml {
+        Some(build_image_from_config(cli, cfg))
+    } else if cli.rebuild || info.spec_file.is_some() {
+        let presets = if !info.base_presets.is_empty() {
+            info.base_presets.clone()
+        } else {
+            parse_presets_from_env_label(&info.preset)
+        };
+        if !presets.is_empty() {
+            Some(build_combined_image(cli, &presets))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let needs_image_refresh = if let Some(ref res) = resolved_image {
+        res.rebuilt
+            || info.image != res.tag
+            || info.spec_hash.as_deref() != Some(res.spec_hash.as_str())
+            || res
+                .image_id
+                .as_deref()
+                .map(|id| !info.image_id.is_empty() && info.image_id != id)
+                .unwrap_or(false)
+    } else {
+        false
+    };
+
     let requested_dir: Option<PathBuf> = if let Some(ref dir) = cli.dir {
         Some(dir.clone())
     } else if cli.mount_cwd {
@@ -1581,13 +1854,40 @@ pub fn attach_box(cli: &Cli, target: &str) {
         }
     };
 
-    let resolve_attach_cmd = |env_label: &str| -> Vec<String> {
+    let resolve_attach_cmd = |env_label: &str, has_bash_opt: Option<bool>| -> Vec<String> {
         if !cli.cmd.is_empty() {
             cli.cmd.clone()
-        } else if env_label == "alpine" {
+        } else if has_bash_opt == Some(false) || (has_bash_opt.is_none() && env_label == "alpine") {
             vec!["sh".to_string()]
         } else {
             vec!["bash".to_string()]
+        }
+    };
+
+    let effective_image_fields = |res_opt: &Option<ResolvedImage>| {
+        if let Some(res) = res_opt {
+            (
+                res.tag.clone(),
+                res.env_label.clone(),
+                res.presets.clone(),
+                Some(res.spec_hash.clone()),
+                res.spec_file.clone(),
+                Some(res.has_bash),
+            )
+        } else {
+            let presets = if !info.base_presets.is_empty() {
+                info.base_presets.clone()
+            } else {
+                parse_presets_from_env_label(&info.preset)
+            };
+            (
+                info.image.clone(),
+                info.preset.clone(),
+                presets,
+                info.spec_hash.clone(),
+                info.spec_file.clone(),
+                None,
+            )
         }
     };
 
@@ -1598,21 +1898,13 @@ pub fn attach_box(cli: &Cli, target: &str) {
     //   3. `--new` is explicitly passed.
     if !cli.cmd.is_empty() || (info.running && !cli.same_tty) || cli.new_vm {
         let target_dir = resolve_attach_dir(&requested_dir);
-        let (image, env_label) = if cli.rebuild {
-            let presets = parse_presets_from_env_label(&info.preset);
-            if !presets.is_empty() {
-                build_combined_image(cli, &presets)
-            } else {
-                (info.image.clone(), info.preset.clone())
-            }
-        } else {
-            (info.image.clone(), info.preset.clone())
-        };
+        let (image, env_label, presets, spec_hash, spec_file, has_bash_opt) =
+            effective_image_fields(&resolved_image);
 
         let sibling_name = cli.name.clone().unwrap_or_else(|| {
             format!("{}-{}", info.name, now_epoch() % 10_000)
         });
-        let effective_cmd = resolve_attach_cmd(&env_label);
+        let effective_cmd = resolve_attach_cmd(&env_label, has_bash_opt);
         let mode_label = format!("NEW VM FROM {}", info.name);
 
         let sibling_port = if info.running && effective_net == NetMode::Local {
@@ -1625,6 +1917,9 @@ pub fn attach_box(cli: &Cli, target: &str) {
             box_name: sibling_name,
             image,
             env_label,
+            presets,
+            spec_hash,
+            spec_file,
             target_dir,
             effective_cmd,
             runtime,
@@ -1672,6 +1967,7 @@ pub fn attach_box(cli: &Cli, target: &str) {
 
     let wants_recreate = !info.running
         && (cli.rebuild
+            || needs_image_refresh
             || needs_net_change
             || needs_host_port_change
             || needs_llama_bin_change
@@ -1684,27 +1980,29 @@ pub fn attach_box(cli: &Cli, target: &str) {
 
     if wants_recreate {
         let target_dir = resolve_attach_dir(&requested_dir);
-
-        let (image, env_label) = if cli.rebuild {
-            let presets = parse_presets_from_env_label(&info.preset);
-            if !presets.is_empty() {
-                build_combined_image(cli, &presets)
-            } else {
-                (info.image.clone(), info.preset.clone())
-            }
-        } else {
-            (info.image.clone(), info.preset.clone())
-        };
+        let (image, env_label, presets, spec_hash, spec_file, has_bash_opt) =
+            effective_image_fields(&resolved_image);
 
         let mount_mode = if cli.rw || info.rw { "rw" } else { "ro" };
-        println!(
-            "[box] Recreating '{}' (image: {}, mount: {} ({}), net: {}, /opt/venv preserved)...",
-            info.name,
-            image,
-            target_dir.display(),
-            mount_mode,
-            effective_net.as_str()
-        );
+        if needs_image_refresh {
+            println!(
+                "[box] Recreating VM '{}' on updated image '{}' (mount: {} ({}), net: {}, /opt/venv preserved)...",
+                info.name,
+                image,
+                target_dir.display(),
+                mount_mode,
+                effective_net.as_str()
+            );
+        } else {
+            println!(
+                "[box] Recreating '{}' (image: {}, mount: {} ({}), net: {}, /opt/venv preserved)...",
+                info.name,
+                image,
+                target_dir.display(),
+                mount_mode,
+                effective_net.as_str()
+            );
+        }
 
         let rm_status = container_cmd(bin, cli.sudo)
             .args(["rm", "-f", &info.name])
@@ -1721,12 +2019,15 @@ pub fn attach_box(cli: &Cli, target: &str) {
             process::exit(1);
         }
 
-        let effective_cmd = resolve_attach_cmd(&env_label);
+        let effective_cmd = resolve_attach_cmd(&env_label, has_bash_opt);
 
         let spec = BoxSpec {
             box_name: info.name,
             image,
             env_label,
+            presets,
+            spec_hash,
+            spec_file,
             target_dir,
             effective_cmd,
             runtime,
@@ -1762,8 +2063,20 @@ pub fn attach_box(cli: &Cli, target: &str) {
         .as_deref()
         .and_then(|v| resolve_volume_host_path(bin, cli.sudo, v));
     let llama_bin_str = info.llama_bin.as_ref().map(|p| p.display().to_string());
+    let spec_file_str = info.spec_file.as_ref().map(|p| p.display().to_string());
+    let display_presets = if !info.base_presets.is_empty() {
+        info.base_presets.clone()
+    } else {
+        parse_presets_from_env_label(&info.preset)
+    };
 
     if info.running {
+        if needs_image_refresh {
+            eprintln!(
+                "[box] Note: image config for '{}' changed and was rebuilt; stop the running VM and re-attach (or omit `--same-tty`) to use the updated packages.",
+                info.name
+            );
+        }
         let net_detail = match effective_net {
             NetMode::None => "air-gapped".to_string(),
             NetMode::Local => "local-only".to_string(),
@@ -1779,6 +2092,8 @@ pub fn attach_box(cli: &Cli, target: &str) {
             mode: "ATTACHED (running)",
             name: &info.name,
             env_label: &info.preset,
+            presets: &display_presets,
+            spec_file: spec_file_str.as_deref(),
             image: &info.image,
             runtime_label: runtime_desc,
             workspace: &info.workspace,
@@ -1842,6 +2157,8 @@ pub fn attach_box(cli: &Cli, target: &str) {
         mode: "STARTING & ATTACHING",
         name: &info.name,
         env_label: &info.preset,
+        presets: &display_presets,
+        spec_file: spec_file_str.as_deref(),
         image: &info.image,
         runtime_label: runtime_desc,
         workspace: &info.workspace,
@@ -2142,6 +2459,24 @@ mod tests {
         assert_eq!(info.host_port, Some(8080));
         assert_eq!(info.llama_bin, Some(PathBuf::from("/opt/my-llama")));
         assert!(is_interactive_shell_cmd(&info.cmd));
+        assert!(info.image_id.is_empty());
+        assert_eq!(info.spec_hash, None);
+        assert_eq!(info.spec_file, None);
+    }
+
+    #[test]
+    fn parses_container_inspect_output_with_spec_metadata() {
+        let raw = "false\t/rust\tlocalhost/box-env:rust\tnone\trust\t/var/home/alex/proj\tkrun\tnone\ttrue\tbox-venv\t<no value>\tkeep-id\t<no value>\ttrue\t<no value>\t<no value>\t<no value>\t[\"bash\"]\tsha256:abcdef123456\tdeadbeef01234567\t/home/alex/.config/box/images/rust.yaml\trust\n";
+        let info = parse_inspect_output(raw).unwrap();
+        assert!(!info.running);
+        assert_eq!(info.name, "rust");
+        assert_eq!(info.image_id, "abcdef123456");
+        assert_eq!(info.spec_hash.as_deref(), Some("deadbeef01234567"));
+        assert_eq!(
+            info.spec_file,
+            Some(PathBuf::from("/home/alex/.config/box/images/rust.yaml"))
+        );
+        assert_eq!(info.base_presets, vec![Preset::Rust]);
     }
 
     #[test]
